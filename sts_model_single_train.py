@@ -90,46 +90,67 @@ def convert_time_to_minutes(time_str):
     return hours * 60 + minutes
 
 
-def create_train_schedule_sts_grid(stations, station_names, max_distance=10, draw_plan=False, draw_line=False):
-    """创建包含列车时刻表约束的STS网格模型"""     
-    # 基本参数
-    # time_nodes = 181   
-    delta_d = 0.5  # 每段距离(km)   500m
-    speed_levels = 5  # 速度级别
-    delta_t = 20/60  # 每段时间(min)  20s，最小可设为10s
+def create_train_schedule_sts_grid(stations_input, station_names_input, delta_d=0.5,
+                                   delta_t=20/60, speed_levels=5, time_diff_minutes=5*60+1, # 默认为5小时的时间窗
+                                   total_distance=50, draw_plan=False, draw_line=False,
+                                   max_distance=30, select_near_plan=True, a_max=10):   # 50km的线路
+    """
+    创建包含列车时刻表约束的STS网格模型
     
-    # 计算时间节点数和空间段数
-    time_diff = convert_time_to_minutes(stations[1][3]) - convert_time_to_minutes(stations[0][2])
-    station_distances = [stations[i][0] for i in range(len(stations))] 
-    total_distance = station_distances[-1]
+    参数:
+        stations_input: 车站信息列表，每个元素包含[位置, 类型, 到达时间, 出发时间]
+        station_names_input: 车站名称字典，键为位置，值为站名
+        delta_d: 空间单位长度，默认为0.5km
+        delta_t: 时间单位长度，默认为20/60分钟
+        speed_levels: 速度级别数量，默认为5
+        time_diff_minutes: 时间窗口长度，默认为5小时1分钟
+        total_distance: 线路总长度，默认为50km
+        draw_plan: 是否绘制计划时刻表，默认为False
+        draw_line: 是否绘制有效弧，默认为False
+        max_distance: 节点到计划时刻表直线的最大距离，默认为30
+        select_near_plan: 是否选择靠近计划时刻表的节点，默认为True
+        a_max: 最大加速度约束，默认为10
+    
+    返回:
+        创建的STS网格模型
+    """
+
+    """创建包含列车时刻表约束的STS网格模型""" 
+    import copy
+    stations = copy.deepcopy(stations_input)
+    station_names = copy.deepcopy(station_names_input) 
+    
+    # 计算时间节点数和空间段数 
+    station_distances = [stations[i][0] for i in range(len(stations))]  
     
     # 初步计算
-    time_nodes = time_diff / delta_t
+    time_nodes = time_diff_minutes / delta_t
     space_segments = total_distance / delta_d
     
     # 矫正机制：确保time_nodes小于space_segments
     if time_nodes >= space_segments:
         # 方案1：调整时间划分，使其更粗略，但不超过10s
-        max_delta_t = 10/60  # 最大时间间隔为10s
-        new_delta_t = min(time_diff / (space_segments - 1), max_delta_t)
+        max_delta_t = 10/60  # 最小时间间隔为10s
+        new_delta_t = min(time_diff_minutes / (space_segments - 1), max_delta_t)
         
         # 如果调整后的时间间隔仍然不能满足条件，则调整空间划分
-        if new_delta_t >= max_delta_t and time_diff / max_delta_t >= space_segments:
+        if new_delta_t >= max_delta_t and time_diff_minutes / max_delta_t >= space_segments:
             # 方案2：调整空间划分，使其更细致
-            new_delta_d = total_distance / (time_diff / max_delta_t + 1)
+            new_delta_d = total_distance / (time_diff_minutes / max_delta_t + 1)
             delta_d = new_delta_d
             delta_t = max_delta_t
         else:
             delta_t = new_delta_t
     
     # 重新计算最终的节点数和段数
-    time_nodes = time_diff / delta_t
-    space_segments = total_distance / delta_d
-    
-    print(f"时间节点数: {time_nodes}, 空间段数: {space_segments}")
-    print(f"时间间隔: {delta_t*60}秒, 空间间隔: {delta_d*1000}米")
+    time_nodes = int(round(time_diff_minutes / delta_t)) # 使用传入的时间差分钟数
+    space_segments = int(round(total_distance / delta_d))
 
-    # 转换站点时刻表
+    print(f"时间节点数: {time_nodes}, 空间段数: {space_segments}")
+    print(f"时间间隔: {delta_t*60:.2f}秒, 空间间隔: {delta_d*1000:.2f}米")
+    print(f"总时间: {time_nodes * delta_t:.2f} 分钟, 总距离: {space_segments * delta_d:.2f} km")
+    
+    # 转换站点时刻表为单位值，位置为栅格索引
     for i in range(len(stations)):
         arrive_time = stations[i][2]
         depart_time = stations[i][3]
@@ -240,7 +261,8 @@ def create_train_schedule_sts_grid(stations, station_names, max_distance=10, dra
                 
             #     # 检查时间是否在允许范围内
             #     if not (earliest_allowed_time <= t <= latest_allowed_time):
-            #         continue
+            #         continue           
+
         else:
             # 非站点位置的规则
             # 规则4: 非站点位置不允许速度为0
@@ -285,11 +307,19 @@ def create_train_schedule_sts_grid(stations, station_names, max_distance=10, dra
             
             # 始发/终点站的节点
             if station_type == 0 and v == 0:
-                ax.scatter(i, t, v, color='red', s=80, marker='*')
+                # ax.scatter(i, t, v, color='red', s=80, marker='*')
+                # 在站点位置绘制垂直线，只画一次
+                if not hasattr(ax, f'vertical_line_drawn_{i}'):
+                    ax.plot([i, i], [0, time_nodes], [0, 0], color='red', linestyle='--', alpha=0.5)
+                    setattr(ax, f'vertical_line_drawn_{i}', True)
             
             # 停靠站的节点
             elif station_type == 2 and v == 0:
-                ax.scatter(i, t, v, color='purple', s=80, marker='s')
+                # ax.scatter(i, t, v, color='purple', s=80, marker='s')
+                # 在站点位置绘制垂直线，只画一次
+                if not hasattr(ax, f'vertical_line_drawn_{i}'):
+                    ax.plot([i, i], [0, time_nodes], [0, 0], color='purple', linestyle='--', alpha=0.5)
+                    setattr(ax, f'vertical_line_drawn_{i}', True)
     # 设置图形标题和轴标签
     ax.set_title('列车时刻表STS网格模型可视化')
     ax.set_xlabel('空间维度 (站点位置/km)')
@@ -343,85 +373,121 @@ def create_train_schedule_sts_grid(stations, station_names, max_distance=10, dra
     ax.legend(loc='upper right')
     
     # 添加网格线以提高可读性，按照实际时空分割的最小单位进行分割
-    ax.grid(False)  # 先关闭默认网格
+    ax.grid(True)  # 先关闭默认网格
     
-    # 在空间维度上添加网格线（每个delta_d单位）
-    for i in range(0, int(space_segments) + 1, 1):
-        ax.plot([i, i], [0, time_nodes], [0, 0], 'gray', alpha=0.3, linestyle=':')
+    # # 在空间维度上添加网格线（每个delta_d单位）
+    # for i in range(0, int(space_segments) + 1, 1):
+    #     ax.plot([i, i], [0, time_nodes], [0, 0], 'gray', alpha=0.3, linestyle=':')
     
-    # 在时间维度上添加网格线（每个delta_t单位）
-    for t in range(0, int(time_nodes) + 1, 1):
-        ax.plot([0, space_segments], [t, t], [0, 0], 'gray', alpha=0.3, linestyle=':')
+    # # 在时间维度上添加网格线（每个delta_t单位）
+    # for t in range(0, int(time_nodes) + 1, 1):
+    #     ax.plot([0, space_segments], [t, t], [0, 0], 'gray', alpha=0.3, linestyle=':')
     
-    # 在速度维度上添加网格线（每个速度级别）
-    for v in range(0, speed_levels + 1, 1):
-        ax.plot([0, 0], [0, time_nodes], [v, v], 'gray', alpha=0.3, linestyle=':')
+    # # 在速度维度上添加网格线（每个速度级别）
+    # for v in range(0, speed_levels + 1, 1):
+    #     ax.plot([0, 0], [0, time_nodes], [v, v], 'gray', alpha=0.3, linestyle=':')
     
-    print(f"已添加网格线：空间单位={delta_d}km，时间单位={delta_t}min，速度级别={speed_levels}")
+    # print(f"已添加网格线：空间单位={delta_d}km，时间单位={delta_t}min，速度级别={speed_levels}")
     
     # 调整视角以获得更好的3D效果
     ax.view_init(elev=30, azim=45)
          
     """============================添加有效弧============================="""  
     print("开始添加有效弧...") 
-    print("正在计算计划时刻表的直线方程...")
-    
-    # 提取站点位置和时间信息
-    station_positions = []
-    station_times = []
-    
-    for station in stations:
-        position = station[0]
-        arrive_time = station[2]
-        depart_time = station[3]
-        
-        # 添加到达时间点
-        station_positions.append(position)
-        station_times.append(arrive_time)
-        
-        # 如果到达时间和出发时间不同，也添加出发时间点
-        if arrive_time != depart_time:
-            station_positions.append(position)
-            station_times.append(depart_time)
-    
-    # 计算直线方程参数 (使用最小二乘法)
-    if len(station_positions) > 1:
-        A = np.vstack([station_positions, np.ones(len(station_positions))]).T
-        m, c = np.linalg.lstsq(A, station_times, rcond=None)[0]
-        
-        print(f"计划时刻表直线方程: t = {m:.4f} * s + {c:.4f}")
-        
-        # 绘制计划时刻表直线
-        s_range = np.array([min(station_positions), max(station_positions)])
-        t_range = m * s_range + c
-        ax.plot(s_range, t_range, [0, 0], 'b--', linewidth=2, label='计划时刻表')
-        
-        # 筛选离直线较近的节点
-        close_nodes = set()
-        for node in valid_nodes:
-            i, t, v = node
-            # 计算节点到直线的距离 (在空间-时间平面上)
-            # 点到直线距离公式: |ax + by + c| / sqrt(a^2 + b^2)
-            # 这里直线方程是 t = m*s + c，转换为标准形式 -m*s + t - c = 0
-            distance = abs(-m * i + t - c) / np.sqrt(m**2 + 1)
-            
-            if distance <= max_distance:
-                close_nodes.add(node)
-        
-        print(f"找到离计划时刻表较近的节点: {len(close_nodes)} 个")
-        
-        # 可视化这些节点                                                # todo： 这块绘制离直线较近的节点
-        # for node in close_nodes:
-        #     i, t, v = node
-        #     ax.scatter(i, t, v, color='cyan', s=30, alpha=0.7)
-        
-        # 更新有效节点集合为离直线较近的节点
-        valid_nodes = close_nodes
-    else:
-        print("警告：站点数量不足，无法计算直线方程")
 
-    # 定义最大加速度约束
-    a_max = 10  # 最大加速度阈值
+    # 根据计划时刻表筛选出离计划时刻表较近的节点
+    if select_near_plan:
+        print("正在计算计划时刻表的直线方程...")
+        
+        # 提取站点位置和时间信息
+        station_positions = []
+        station_times = []
+        
+        for station in stations:
+            position = station[0]
+            arrive_time = station[2]
+            depart_time = station[3]
+            
+            # 添加到达时间点
+            station_positions.append(position)
+            station_times.append(arrive_time)
+            
+            # 如果到达时间和出发时间不同，也添加出发时间点
+            if arrive_time != depart_time:
+                station_positions.append(position)
+                station_times.append(depart_time)
+        
+        # 计算直线方程参数 (使用最小二乘法)
+        if len(station_positions) > 1:
+            # 按照站点对划分线段，每两个相邻站点之间绘制一条直线
+            close_nodes = set()
+            print("计算站点间的直线方程：")
+            
+            # 获取唯一的站点位置
+            unique_station_positions = []
+            for pos in station_positions:
+                if pos not in unique_station_positions:
+                    unique_station_positions.append(pos)
+            unique_station_positions.sort()
+            
+            # 为每对相邻站点计算直线方程
+            for i in range(len(unique_station_positions) - 1):
+                start_pos = unique_station_positions[i]
+                end_pos = unique_station_positions[i+1]
+                
+                # 找出这两个站点对应的时间点
+                start_times = []
+                end_times = []
+                
+                for j, pos in enumerate(station_positions):
+                    if pos == start_pos:
+                        start_times.append(station_times[j])
+                    elif pos == end_pos:
+                        end_times.append(station_times[j])
+                
+                # 使用最早的到达时间和最晚的出发时间
+                start_time = min(start_times)
+                end_time = max(end_times)
+                
+                # 计算直线方程: t = m*s + c
+                if end_pos > start_pos:  # 防止除以零
+                    m = (end_time - start_time) / (end_pos - start_pos)
+                    c = start_time - m * start_pos
+                    
+                    print(f"站点 {station_names.get(start_pos, start_pos)} 到 {station_names.get(end_pos, end_pos)} 的直线方程: t = {m:.4f} * s + {c:.4f}")
+                    
+                    # 绘制这段直线
+                    s_range = np.array([start_pos, end_pos])
+                    t_range = m * s_range + c
+                    ax.plot(s_range, t_range, [0, 0], 'b--', linewidth=2, 
+                        label=f"{station_names.get(start_pos, start_pos)}-{station_names.get(end_pos, end_pos)}" if i == 0 else "_nolegend_")
+                    
+                    # 筛选离这条直线较近的节点
+                    for node in valid_nodes:
+                        i_pos, t, v = node
+                        # 只考虑在当前站点区间内的节点
+                        if start_pos <= i_pos <= end_pos:
+                            # 计算节点到直线的距离 (在空间-时间平面上)
+                            # 点到直线距离公式: |ax + by + c| / sqrt(a^2 + b^2)
+                            # 这里直线方程是 t = m*s + c，转换为标准形式 -m*s + t - c = 0
+                            distance = abs(-m * i_pos + t - c) / np.sqrt(m**2 + 1)
+                            
+                            if distance <= max_distance:
+                                close_nodes.add(node)
+            
+            print(f"找到离计划时刻表较近的节点: {len(close_nodes)} 个")
+            
+            # 可视化这些节点                                                # todo： 这块绘制离直线较近的节点
+            # for node in close_nodes:
+            #     i, t, v = node
+            #     ax.scatter(i, t, v, color='cyan', s=30, alpha=0.7)
+            
+            # plt.show()
+            # 更新有效节点集合为离直线较近的节点
+            valid_nodes = close_nodes
+            
+        else:
+            print("警告：站点数量不足，无法计算直线方程")
     
     # 存储所有有效弧
     valid_arcs = []
@@ -444,6 +510,20 @@ def create_train_schedule_sts_grid(stations, station_names, max_distance=10, dra
             
             for node_to in nodes_by_time[t + 1]:
                 j, _, u = node_to  # 下一节点的位置、时间和速度
+
+                # 检查是否有中间停靠站
+                has_intermediate_stop = False
+                for station in stations:
+                    station_pos = station[0]
+                    station_type = station[1]
+                    # 检查是否是停靠站（类型2）且位于当前节点和下一节点之间
+                    if station_type == 2 and i < station_pos < j:
+                        has_intermediate_stop = True
+                        break
+                
+                # 如果有中间停靠站，则不添加这条弧
+                if has_intermediate_stop:
+                    continue
                 
                 # 计算位移
                 d = j - i
@@ -473,7 +553,7 @@ def create_train_schedule_sts_grid(stations, station_names, max_distance=10, dra
                         arrow = Arrow3D([i, j], [t, t+1], [v, u], 
                                     mutation_scale=15, lw=1.5, arrowstyle='-|>', color=arc_color)
                         ax.add_artist(arrow)
-    
+    # plt.show()
     print(f"添加的有效弧数量: {len(valid_arcs)}") 
 
     """======================绘制时间-空间二维平面上的计划方案=======================""" 
@@ -593,29 +673,46 @@ def create_train_schedule_sts_grid(stations, station_names, max_distance=10, dra
             graph[from_node] = []
         
         # 计算弧的代价（考虑能耗最小化）
-        # 能耗模型：加速消耗更多能量，匀速消耗适中，减速消耗较少
+        # 计算能耗
         cost = 1.0  # 基础代价
-        if v2 > v1:  # 加速
-            cost += 0.5 * (v2 - v1)**2  # 加速能耗与加速度平方成正比
-        elif v2 < v1:  # 减速
-            cost += 0.1 * (v1 - v2)  # 减速能耗较小
-        else:  # 匀速
-            cost += 0.2 * v1  # 匀速能耗与速度成正比
         
-        # 额外考虑与时刻表的一致性
-        # 检查是否经过站点，如果经过站点，检查时间是否与时刻表一致
+        # 计算加速度 acc(i, j, t, s, u, v)
+        if t2 > t1:  # 确保时间差不为零
+            # 根据公式计算加速度：acc(i, j, t, s, u, v) = max{(v-u)/(s-t) + w((u+v)/2) + (h(i)+h(j))/2, 0}
+            # 这里简化处理，不考虑坡度和风阻，即 w=0, h(i)=h(j)=0
+            acc = max((v2 - v1) / (t2 - t1), 0)
+            
+            # 计算能耗 e(i, j, t, s, u, v) = m × acc × (u + v) / 2 × (s − t)
+            # 假设列车质量 m = 1（可以根据需要调整）
+            m = 1.0
+            
+            # 特殊情况处理
+            if i == j:  # 火车等待或停止的弧
+                energy = 0
+            elif v2 < v1:  # 减速的行驶弧
+                energy = 0
+            else:  # 加速或匀速
+                energy = m * acc * (v1 + v2) / 2 * (t2 - t1)
+                
+            cost = energy
+        
+        # 额外考虑与时刻表的一致性 
         for station in stations:
             station_pos, station_type, arrive_time, depart_time, _ = station
             
-            # 如果弧的起点或终点在站点上
-            if (i == station_pos and t1 != arrive_time and t1 != depart_time) or \
-               (j == station_pos and t2 != arrive_time and t2 != depart_time):
-                # 不符合时刻表的站点时间，增加惩罚
-                cost += 100.0
-                break
+            # 如果弧的起点或终点在站点上，计算与计划时间的偏差
+            if i == station_pos:
+                # 如果是出发站点，与出发时间比较
+                time_diff = abs(t1 - depart_time)
+                # 根据偏差大小增加惩罚，偏差越大惩罚越大
+                cost += time_diff * 10.0  # 使用线性惩罚，可以根据需要调整系数
+            elif j == station_pos:
+                # 如果是到达站点，与到达时间比较
+                time_diff = abs(t2 - arrive_time)
+                # 根据偏差大小增加惩罚，偏差越大惩罚越大
+                cost += time_diff * 10.0  # 使用线性惩罚，可以根据需要调整系数
         
         graph[from_node].append((to_node, cost))
-    
     # 使用Dijkstra算法找最短路径
     check_end_node_in_graph(graph, stations)
     import heapq
@@ -657,9 +754,7 @@ def create_train_schedule_sts_grid(stations, station_names, max_distance=10, dra
         if d > dist[u]:
             continue
             
-        # 如果节点已经访问过（其最短路径已确定），跳过
-        # 注意：在某些Dijkstra实现中，此检查可能不是必需的，
-        # 因为 d > dist[u] 的检查通常足够。但加上也无妨。
+        # 如果节点已经访问过（其最短路径已确定），跳过 注意：在某些Dijkstra实现中，此检查可能不是必需的， 因为 d > dist[u] 的检查通常足够。但加上也无妨。
         if u in visited_nodes:
             continue
         visited_nodes.add(u)
@@ -736,26 +831,7 @@ def create_train_schedule_sts_grid(stations, station_names, max_distance=10, dra
         print("最优路径已找到！")
         print(f"路径长度: {len(path)} 节点")
         print(f"总能耗代价: {dist[end_node]:.2f}")
-        
-        # 提取路径坐标用于绘图
-        path_space = [node[0] for node in path]
-        path_time = [node[1] for node in path]
-        path_speed = [node[2] for node in path]
-        
-        # 在图上绘制最优路径
-        ax.plot(path_space, path_time, path_speed, 'y-', linewidth=3, label='最优路径')
-        
-        # 在路径上标记关键点
-        for idx, node in enumerate(path):
-            i, t, v = node
-            # 检查是否在站点上
-            for station in stations:
-                if i == station[0]: 
-                    # 检查是否是到达或出发时间点
-                    if t == station[2] or t == station[3]:
-                        ax.scatter(i, t, v, color='yellow', s=120, marker='*', edgecolors='black') 
-                    break
-        
+                
         # 打印时刻表
         print("\n最优路径时刻表:")
         print("站点\t计划到达\t计划出发\t实际到达\t实际出发\t最高速度")
@@ -832,16 +908,62 @@ def create_train_schedule_sts_grid(stations, station_names, max_distance=10, dra
                 color='purple', linewidth=2, linestyle='--', alpha=0.5, label='时间-速度投影')
         
         print("最优路径轨迹绘制完成！")
+        
+        # 修改坐标轴，使用实际的时间和位置值
+        # 设置空间轴的刻度
+        space_ticks = np.linspace(0, space_segments, num=6)
+        space_tick_labels = [f"{x*delta_d:.1f}" for x in space_ticks]
+        ax.set_xticks(space_ticks)
+        ax.set_xticklabels(space_tick_labels)
+        
+        # 设置时间轴的刻度
+        time_ticks = np.linspace(0, time_nodes, num=6)
+        # 将时间单位转换回实际时间
+        base_time = 8 * 60  # 基准时间为8:00（分钟表示）
+        time_tick_labels = []
+        for t in time_ticks:
+            minutes = base_time + t * delta_t  # 转换为分钟
+            hours = int(minutes // 60)
+            mins = int(minutes % 60)
+            time_tick_labels.append(f"{hours:02d}:{mins:02d}")
+        ax.set_yticks(time_ticks)
+        ax.set_yticklabels(time_tick_labels)
+        
+        # 速度轴的刻度
+        speed_ticks = np.linspace(0, speed_levels, num=speed_levels+1)
+        # 转换速度单位为实际速度 km/h
+        speed_tick_labels = [f"{v*3.6*delta_d/delta_t:.0f}" for v in speed_ticks]
+        ax.set_zticks(speed_ticks)
+        ax.set_zticklabels(speed_tick_labels)
+        
+        # 更新坐标轴标签
+        ax.set_xlabel('空间维度 (km)')
+        ax.set_ylabel('时间')
+        ax.set_zlabel('速度 (km/h)')
+        
         plt.tight_layout() 
         plt.show() 
 
 if __name__ == "__main__":
     stations = [
         [0, 0, '8:00', '8:00', 10],  # 北京南站(始发站) 
-        [70, 0, '8:20', '8:20', 10],  # 廊坊站(通过站) 
+        [70, 2, '8:20', '8:25', 10],  # 廊坊站(停靠站) 
+        [140, 1, '9:00', '9:00', 10],  # 天津站(通过站)
+        [200, 0, '9:30', '9:30', 10],  # 滨海站(终点站)
     ]
     station_names = {
         0: "北京南",
-        70: "廊坊"
+        70: "廊坊",
+        140: "天津",
+        200: "滨海"
     }
-    create_train_schedule_sts_grid(stations, station_names, max_distance=30, draw_plan=False, draw_line=False) 
+    create_train_schedule_sts_grid(stations, 
+                                   station_names, 
+                                   delta_d=5,    # 0.5km
+                                   delta_t=5,   # 20秒
+                                   speed_levels=5, 
+                                   time_diff_minutes=2*60+1,   # 调度范围是一个小时
+                                   total_distance=300,    # 100km的线路
+                                   draw_plan=False, 
+                                   draw_line=False,
+                                   max_distance=10)    # 20
