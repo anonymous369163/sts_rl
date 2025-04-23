@@ -90,7 +90,7 @@ def convert_time_to_minutes(time_str):
     return hours * 60 + minutes
 
 
-def create_train_schedule_sts_grid(stations_input, station_names_input, delta_d=0.5,
+def create_train_schedule_sts_grid(train_schedule, station_names_input, delta_d=0.5,
                                    delta_t=20/60, speed_levels=5, time_diff_minutes=5*60+1, # 默认为5小时的时间窗
                                    total_distance=50, draw_plan=False, draw_line=False,
                                    max_distance=30, select_near_plan=True, a_max=10):   # 50km的线路
@@ -98,7 +98,7 @@ def create_train_schedule_sts_grid(stations_input, station_names_input, delta_d=
     创建包含列车时刻表约束的STS网格模型
     
     参数:
-        stations_input: 车站信息列表，每个元素包含[位置, 类型, 到达时间, 出发时间]
+        train_schedule: 列车时刻表列表，每个元素包含[位置, 类型, 到达时间, 出发时间]
         station_names_input: 车站名称字典，键为位置，值为站名
         delta_d: 空间单位长度，默认为0.5km
         delta_t: 时间单位长度，默认为20/60分钟
@@ -117,7 +117,7 @@ def create_train_schedule_sts_grid(stations_input, station_names_input, delta_d=
 
     """创建包含列车时刻表约束的STS网格模型""" 
     import copy
-    stations = copy.deepcopy(stations_input)
+    stations = copy.deepcopy(train_schedule)
     station_names = copy.deepcopy(station_names_input) 
     
     # 计算时间节点数和空间段数 
@@ -156,8 +156,7 @@ def create_train_schedule_sts_grid(stations_input, station_names_input, delta_d=
         depart_time = stations[i][3]
         # 转换到达和出发时间
         stations[i][2] = convert_time_to_units(arrive_time, delta_t)
-        stations[i][3] = convert_time_to_units(depart_time, delta_t)
-        # 栅格化站点位置
+        stations[i][3] = convert_time_to_units(depart_time, delta_t) 
         stations[i][0] = int(round(stations[i][0] / delta_d))
     # 修改station_names中的键，使其与栅格化后的站点位置对应
     new_station_names = {}
@@ -945,7 +944,7 @@ def create_train_schedule_sts_grid(stations_input, station_names_input, delta_d=
         plt.show() 
 
 if __name__ == "__main__":
-    stations = [
+    train_schedule = [
         [0, 0, '8:00', '8:00', 10],  # 北京南站(始发站) 
         [70, 2, '8:20', '8:25', 10],  # 廊坊站(停靠站) 
         [140, 1, '9:00', '9:00', 10],  # 天津站(通过站)
@@ -957,7 +956,7 @@ if __name__ == "__main__":
         140: "天津",
         200: "滨海"
     }
-    create_train_schedule_sts_grid(stations, 
+    create_train_schedule_sts_grid(train_schedule, 
                                    station_names, 
                                    delta_d=5,    # 0.5km
                                    delta_t=5,   # 20秒
