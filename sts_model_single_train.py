@@ -90,15 +90,44 @@ def convert_time_to_minutes(time_str):
     return hours * 60 + minutes
 
 
-def create_train_schedule_sts_grid(stations, station_names):
-    """创建包含列车时刻表约束的STS网格模型"""
+def create_train_schedule_sts_grid(stations, station_names, max_distance=10, draw_plan=False, draw_line=False):
+    """创建包含列车时刻表约束的STS网格模型"""     
     # 基本参数
     # time_nodes = 181   
-    delta_d = 0.1  # 每段距离(km)   100m
+    delta_d = 0.5  # 每段距离(km)   500m
     speed_levels = 5  # 速度级别
-    delta_t = 1  # 每段时间(min)  10s
+    delta_t = 20/60  # 每段时间(min)  20s，最小可设为10s
     
-    time_nodes = (convert_time_to_minutes(stations[1][3]) - convert_time_to_minutes(stations[0][2])) / delta_t  # 每段时间(min)
+    # 计算时间节点数和空间段数
+    time_diff = convert_time_to_minutes(stations[1][3]) - convert_time_to_minutes(stations[0][2])
+    station_distances = [stations[i][0] for i in range(len(stations))] 
+    total_distance = station_distances[-1]
+    
+    # 初步计算
+    time_nodes = time_diff / delta_t
+    space_segments = total_distance / delta_d
+    
+    # 矫正机制：确保time_nodes小于space_segments
+    if time_nodes >= space_segments:
+        # 方案1：调整时间划分，使其更粗略，但不超过10s
+        max_delta_t = 10/60  # 最大时间间隔为10s
+        new_delta_t = min(time_diff / (space_segments - 1), max_delta_t)
+        
+        # 如果调整后的时间间隔仍然不能满足条件，则调整空间划分
+        if new_delta_t >= max_delta_t and time_diff / max_delta_t >= space_segments:
+            # 方案2：调整空间划分，使其更细致
+            new_delta_d = total_distance / (time_diff / max_delta_t + 1)
+            delta_d = new_delta_d
+            delta_t = max_delta_t
+        else:
+            delta_t = new_delta_t
+    
+    # 重新计算最终的节点数和段数
+    time_nodes = time_diff / delta_t
+    space_segments = total_distance / delta_d
+    
+    print(f"时间节点数: {time_nodes}, 空间段数: {space_segments}")
+    print(f"时间间隔: {delta_t*60}秒, 空间间隔: {delta_d*1000}米")
 
     # 转换站点时刻表
     for i in range(len(stations)):
@@ -106,17 +135,17 @@ def create_train_schedule_sts_grid(stations, station_names):
         depart_time = stations[i][3]
         # 转换到达和出发时间
         stations[i][2] = convert_time_to_units(arrive_time, delta_t)
-        stations[i][3] = convert_time_to_units(depart_time, delta_t)  
-    
-    # 各站点的实际里程(从起点开始)
-    station_distances = [stations[i][0] for i in range(len(stations))] 
-    
-    # 计算总距离
-    total_distance = station_distances[-1]
-    
-    # 空间维度等间隔分割 
-    space_segments = total_distance / delta_d  # 每段距离(km)
-    
+        stations[i][3] = convert_time_to_units(depart_time, delta_t)
+        # 栅格化站点位置
+        stations[i][0] = int(round(stations[i][0] / delta_d))
+    # 修改station_names中的键，使其与栅格化后的站点位置对应
+    new_station_names = {}
+    for pos, name in station_names.items():
+        # 栅格化站点位置
+        new_pos = int(round(pos / delta_d))
+        new_station_names[new_pos] = name 
+    station_names = new_station_names 
+        
     # 将站点位置映射到分段后的位置
     station_positions = [int(round(dist / delta_d)) for dist in station_distances]
     
@@ -130,10 +159,8 @@ def create_train_schedule_sts_grid(stations, station_names):
     
     # 设置坐标范围
     space_range = np.arange(0, space_segments + 1)
-    time_range = np.arange(0, time_nodes)
-    speed_range = np.arange(0, speed_levels)
-
-    time_gap = 2
+    time_range = np.arange(0, time_nodes+1)
+    speed_range = np.arange(0, speed_levels+1)
 
     """============================创建STS网格模型============================="""  
     print("正在创建STS网格模型...")
@@ -173,12 +200,12 @@ def create_train_schedule_sts_grid(stations, station_names):
                 continue
                 
             # 规则2: 停靠站只在到达和离开时间范围内允许速度为0
-            if station_type == 2 and v == 0 and (t < arrive_time or t > depart_time):
-                continue
+            # if station_type == 2 and v == 0 and (t < arrive_time or t > depart_time):
+            #     continue
 
             # 规则2.1: 停靠站在时间窗范围外的时间点删掉
-            if station_type == 2 and (t < arrive_time - time_gap or t > depart_time + time_gap):
-                continue 
+            # if station_type == 2 and (t < arrive_time - time_gap or t > depart_time + time_gap):
+            #     continue 
                 
             # 规则2.2: 停靠站在停靠期间速度必须为0
             if station_type == 2 and v != 0:
@@ -192,28 +219,28 @@ def create_train_schedule_sts_grid(stations, station_names):
                 continue
             # 规则7: 所有车站列车的到达时间需要在预定时间的范围内 
             # 对于停靠站，检查节点时间是否在预定到达时间前10分钟到发车时间后10分钟的范围内
-            if station_type == 2:
-                # 到达时间向前延展10分钟，发车时间向后延展10分钟
-                earliest_allowed_time = arrive_time - time_gap
-                latest_allowed_time = depart_time + time_gap
-                # 检查时间是否在允许范围内
-                if not (earliest_allowed_time <= t <= latest_allowed_time):
-                    continue
+            # if station_type == 2:
+            #     # 到达时间向前延展10分钟，发车时间向后延展10分钟
+            #     earliest_allowed_time = arrive_time - time_gap
+            #     latest_allowed_time = depart_time + time_gap
+            #     # 检查时间是否在允许范围内
+            #     if not (earliest_allowed_time <= t <= latest_allowed_time):
+            #         continue
             # 规则8: 对于起点和终点站，列车的时间同样需要在计划时间的10分钟范围内
-            if station_type == 0:
-                # 起点站使用出发时间，终点站使用到达时间
-                if i == stations[0][0]:  # 起点站
-                    reference_time = depart_time
-                else:  # 终点站
-                    reference_time = arrive_time
+            # if station_type == 0:
+            #     # 起点站使用出发时间，终点站使用到达时间
+            #     if i == stations[0][0]:  # 起点站
+            #         reference_time = depart_time
+            #     else:  # 终点站
+            #         reference_time = arrive_time
                     
-                # 允许的时间范围：计划时间前后10分钟
-                earliest_allowed_time = reference_time - time_gap
-                latest_allowed_time = reference_time + time_gap
+            #     # 允许的时间范围：计划时间前后10分钟
+            #     earliest_allowed_time = reference_time - time_gap
+            #     latest_allowed_time = reference_time + time_gap
                 
-                # 检查时间是否在允许范围内
-                if not (earliest_allowed_time <= t <= latest_allowed_time):
-                    continue
+            #     # 检查时间是否在允许范围内
+            #     if not (earliest_allowed_time <= t <= latest_allowed_time):
+            #         continue
         else:
             # 非站点位置的规则
             # 规则4: 非站点位置不允许速度为0
@@ -229,24 +256,20 @@ def create_train_schedule_sts_grid(stations, station_names):
     
     # 将有效节点集合转换为列表  
     valid_nodes = list(valid_nodes_set)
-
     """============================绘制有效STS网格节点============================="""  
     # 将有效节点绘制成三维空间的散点图
-    print("正在绘制有效STS网格节点...")
-    
-    # 提取有效节点的坐标
+    print("正在绘制有效STS网格节点...") 
+    # 提取有效节点的坐标    # todo： 这块绘制有效的节点
     # space_coords = [node[0] for node in valid_nodes]
     # time_coords = [node[1] for node in valid_nodes]
-    # speed_coords = [node[2] for node in valid_nodes]
-    # 绘制散点图 - 减小点的大小从30到15
-    # ax.scatter(space_coords, time_coords, speed_coords,                       # todo： 这块绘制有效的节点
+    # speed_coords = [node[2] for node in valid_nodes] 
+    # ax.scatter(space_coords, time_coords, speed_coords,                     
     #            color='blue', s=15, alpha=0.6, marker='o',
     #            label='有效STS网格顶点')
     
     # 为不同类型的节点使用不同颜色
     for node in valid_nodes:
         i, t, v = node
-        
         # 检查节点是否在站点上
         is_at_station = False
         station_info = None
@@ -275,13 +298,6 @@ def create_train_schedule_sts_grid(stations, station_names):
 
     # 在图中标记车站信息
     print("正在标记车站信息...")
-    
-    # 假设stations列表中包含车站名称信息
-    # 如果stations中没有具体车站名，这里需要定义车站名称
-    station_names = {
-        station_positions[0]: "北京南",
-        station_positions[1]: "廊坊"
-    }
     
     # 为每个车站添加标记和标签
     for station in stations:
@@ -326,15 +342,28 @@ def create_train_schedule_sts_grid(stations, station_names):
     # 添加图例
     ax.legend(loc='upper right')
     
-    # 添加网格线以提高可读性
-    ax.grid(True)
+    # 添加网格线以提高可读性，按照实际时空分割的最小单位进行分割
+    ax.grid(False)  # 先关闭默认网格
+    
+    # 在空间维度上添加网格线（每个delta_d单位）
+    for i in range(0, int(space_segments) + 1, 1):
+        ax.plot([i, i], [0, time_nodes], [0, 0], 'gray', alpha=0.3, linestyle=':')
+    
+    # 在时间维度上添加网格线（每个delta_t单位）
+    for t in range(0, int(time_nodes) + 1, 1):
+        ax.plot([0, space_segments], [t, t], [0, 0], 'gray', alpha=0.3, linestyle=':')
+    
+    # 在速度维度上添加网格线（每个速度级别）
+    for v in range(0, speed_levels + 1, 1):
+        ax.plot([0, 0], [0, time_nodes], [v, v], 'gray', alpha=0.3, linestyle=':')
+    
+    print(f"已添加网格线：空间单位={delta_d}km，时间单位={delta_t}min，速度级别={speed_levels}")
     
     # 调整视角以获得更好的3D效果
     ax.view_init(elev=30, azim=45)
          
     """============================添加有效弧============================="""  
-    print("开始添加有效弧...")
-    # 计算计划时刻表的直线方程
+    print("开始添加有效弧...") 
     print("正在计算计划时刻表的直线方程...")
     
     # 提取站点位置和时间信息
@@ -367,9 +396,6 @@ def create_train_schedule_sts_grid(stations, station_names):
         t_range = m * s_range + c
         ax.plot(s_range, t_range, [0, 0], 'b--', linewidth=2, label='计划时刻表')
         
-        # 定义节点到直线的最大距离阈值
-        max_distance = 50  # 可以根据需要调整
-        
         # 筛选离直线较近的节点
         close_nodes = set()
         for node in valid_nodes:
@@ -385,16 +411,15 @@ def create_train_schedule_sts_grid(stations, station_names):
         print(f"找到离计划时刻表较近的节点: {len(close_nodes)} 个")
         
         # 可视化这些节点                                                # todo： 这块绘制离直线较近的节点
-        for node in close_nodes:
-            i, t, v = node
-            ax.scatter(i, t, v, color='cyan', s=30, alpha=0.7)
+        # for node in close_nodes:
+        #     i, t, v = node
+        #     ax.scatter(i, t, v, color='cyan', s=30, alpha=0.7)
         
         # 更新有效节点集合为离直线较近的节点
         valid_nodes = close_nodes
     else:
         print("警告：站点数量不足，无法计算直线方程")
 
-    draw_line = False
     # 定义最大加速度约束
     a_max = 10  # 最大加速度阈值
     
@@ -423,8 +448,7 @@ def create_train_schedule_sts_grid(stations, station_names):
                 # 计算位移
                 d = j - i
                 
-                # 检查速度和位置的耦合关系（匀加速/匀减速）
-                # 末速度应该等于2倍的平均速度减去初始速度 
+                # 检查速度和位置的耦合关系（匀加速/匀减速）  末速度应该等于2倍的平均速度减去初始速度 
                 expected_end_speed = 2 * (d / 1) - v
                 
                 # 检查加速度约束
@@ -453,91 +477,88 @@ def create_train_schedule_sts_grid(stations, station_names):
     print(f"添加的有效弧数量: {len(valid_arcs)}") 
 
     """======================绘制时间-空间二维平面上的计划方案=======================""" 
-
-    # 在当前三维图中添加二维投影
-    # 创建一个平面来显示时间-空间投影
-    x_min, x_max = 0, space_segments
-    y_min, y_max = 0, time_nodes
-    z_min = 0
-    
-    # 创建一个平面网格
-    xx, yy = np.meshgrid(np.linspace(x_min, x_max, 2), np.linspace(y_min, y_max, 2))
-    zz = np.zeros_like(xx) + z_min
-    
-    # 绘制半透明平面
-    ax.plot_surface(xx, yy, zz, alpha=0.1, color='gray')
-    
-    # 在平面上绘制站点位置
-    for station in stations:
-        station_pos = station[0]
-        # 绘制站点水平线
-        ax.plot([station_pos, station_pos], [0, time_nodes], [z_min, z_min], 'k--', alpha=0.5)
-    
-    # 直接根据站点计划时间绘制列车运行线
-    # 创建站点位置和时间的列表
-    train_space_coords = []
-    train_time_coords = []
-    
-    # 添加始发站出发时间点
-    train_space_coords.append(stations[0][0])
-    train_time_coords.append(stations[0][3])  # 出发时间
-    
-    # 添加中间停靠站的到达和出发时间点
-    for station in stations[1:-1]:
-        if station[1] == 2:  # 停靠站
-            # 到达时间点
-            train_space_coords.append(station[0])
-            train_time_coords.append(station[2])
-            # 出发时间点
-            train_space_coords.append(station[0])
-            train_time_coords.append(station[3])
-        elif station[1] == 1:  # 通过站
-            train_space_coords.append(station[0])
-            train_time_coords.append(station[2])  # 通过时间
-    
-    # 添加终点站到达时间点
-    train_space_coords.append(stations[-1][0])
-    train_time_coords.append(stations[-1][2])  # 到达时间
-    
-    # 绘制列车运行线（改为浅蓝色虚线）
-    ax.plot(train_space_coords, train_time_coords, [z_min] * len(train_space_coords), 
-            'c--', alpha=0.9, linewidth=3, label='列车运行线')
-    
-    # 标记站点的计划时间
-    for station in stations:
-        station_pos = station[0]
-        station_type = station[1]
-        arrive_time = station[2]
-        depart_time = station[3]
+    if draw_plan:
+        # 在当前三维图中添加二维投影 
+        x_min, x_max = 0, space_segments
+        y_min, y_max = 0, time_nodes
+        z_min = 0
         
-        # 对于始发站，只标记出发时间
-        if station_type == 0 and station_pos == stations[0][0]:
-            ax.scatter(station_pos, depart_time, z_min, color='red', s=80, marker='o') 
+        # 创建一个平面网格
+        xx, yy = np.meshgrid(np.linspace(x_min, x_max, 2), np.linspace(y_min, y_max, 2))
+        zz = np.zeros_like(xx) + z_min
         
-        # 对于终点站，只标记到达时间
-        elif station_type == 0 and station_pos == stations[-1][0]:
-            ax.scatter(station_pos, arrive_time, z_min, color='red', s=80, marker='o') 
+        # 绘制半透明平面
+        ax.plot_surface(xx, yy, zz, alpha=0.1, color='gray')
         
-        # 对于停靠站，标记到达和出发时间
-        elif station_type == 2:
-            station_idx = [s[0] for s in stations].index(station_pos) 
+        # 在平面上绘制站点位置
+        for station in stations:
+            station_pos = station[0]
+            # 绘制站点水平线
+            ax.plot([station_pos, station_pos], [0, time_nodes], [z_min, z_min], 'k--', alpha=0.5)
+        
+        # 直接根据站点计划时间绘制列车运行线
+        # 创建站点位置和时间的列表
+        train_space_coords = []
+        train_time_coords = []
+        
+        # 添加始发站出发时间点
+        train_space_coords.append(stations[0][0])
+        train_time_coords.append(stations[0][3])  # 出发时间
+        
+        # 添加中间停靠站的到达和出发时间点
+        for station in stations[1:-1]:
+            if station[1] == 2:  # 停靠站
+                # 到达时间点
+                train_space_coords.append(station[0])
+                train_time_coords.append(station[2])
+                # 出发时间点
+                train_space_coords.append(station[0])
+                train_time_coords.append(station[3])
+            elif station[1] == 1:  # 通过站
+                train_space_coords.append(station[0])
+                train_time_coords.append(station[2])  # 通过时间
+        
+        # 添加终点站到达时间点
+        train_space_coords.append(stations[-1][0])
+        train_time_coords.append(stations[-1][2])  # 到达时间
+        
+        # 绘制列车运行线（改为浅蓝色虚线）
+        ax.plot(train_space_coords, train_time_coords, [z_min] * len(train_space_coords), 
+                'c--', alpha=0.9, linewidth=3, label='列车运行线')
+        
+        # 标记站点的计划时间
+        for station in stations:
+            station_pos = station[0]
+            station_type = station[1]
+            arrive_time = station[2]
+            depart_time = station[3]
             
-            ax.scatter(station_pos, arrive_time, z_min, color='green', s=80, marker='o') 
+            # 对于始发站，只标记出发时间
+            if station_type == 0 and station_pos == stations[0][0]:
+                ax.scatter(station_pos, depart_time, z_min, color='red', s=80, marker='o') 
             
-            ax.scatter(station_pos, depart_time, z_min, color='blue', s=80, marker='o') 
+            # 对于终点站，只标记到达时间
+            elif station_type == 0 and station_pos == stations[-1][0]:
+                ax.scatter(station_pos, arrive_time, z_min, color='red', s=80, marker='o') 
+            
+            # 对于停靠站，标记到达和出发时间
+            elif station_type == 2:
+                station_idx = [s[0] for s in stations].index(station_pos) 
+                
+                ax.scatter(station_pos, arrive_time, z_min, color='green', s=80, marker='o') 
+                
+                ax.scatter(station_pos, depart_time, z_min, color='blue', s=80, marker='o') 
+            
+            # 对于通过站，标记通过时间
+            elif station_type == 1:
+                station_idx = [s[0] for s in stations].index(station_pos) 
+                
+                ax.scatter(station_pos, arrive_time, z_min, color='purple', s=80, marker='o') 
         
-        # 对于通过站，标记通过时间
-        elif station_type == 1:
-            station_idx = [s[0] for s in stations].index(station_pos) 
-            
-            ax.scatter(station_pos, arrive_time, z_min, color='purple', s=80, marker='o') 
-    
-    # 添加图例说明
-    ax.text(0, time_nodes-1, z_min, "时间-空间二维投影", color='black', fontsize=12, 
-            bbox=dict(facecolor='white', alpha=0.7))
-
+        # 添加图例说明
+        ax.text(0, time_nodes-1, z_min, "时间-空间二维投影", color='black', fontsize=12, 
+                bbox=dict(facecolor='white', alpha=0.7))
     """============================动态规划方法构建最优路径============================="""  
-
     # 使用动态规划方法来从这个STS网络里构建出最优路径出来，得到时刻表
     print("正在使用动态规划方法构建最优路径...")
     
@@ -699,7 +720,6 @@ def create_train_schedule_sts_grid(stations, station_names):
         plt.show()
         return
 
-
     """============================重建最短路径============================="""
     path = []
     current = end_node
@@ -746,7 +766,7 @@ def create_train_schedule_sts_grid(stations, station_names):
         for node in path:
             i, t, v = node
             # 检查是否在站点上
-            for station_idx, station_pos in enumerate(station_positions):
+            for station_pos in station_positions:
                 if i == station_pos:
                     if station_pos not in station_actual_times:
                         station_actual_times[station_pos] = {"arrive": t, "depart": t, "max_speed": v}
@@ -762,7 +782,7 @@ def create_train_schedule_sts_grid(stations, station_names):
             actual_depart = station_actual_times.get(station_pos, {}).get("depart", "-")
             max_speed = station_actual_times.get(station_pos, {}).get("max_speed", 0)
             
-            print(f"{station_names[station_positions[station_idx]]}\t{plan_arrive}\t{plan_depart}\t{actual_arrive}\t{actual_depart}\t{max_speed}")
+            print(f"{station_names[station_pos]}\t{plan_arrive}\t{plan_depart}\t{actual_arrive}\t{actual_depart}\t{max_speed}")
         
         # 计算与时刻表的一致性
         consistency = 0
@@ -817,11 +837,11 @@ def create_train_schedule_sts_grid(stations, station_names):
 
 if __name__ == "__main__":
     stations = [
-        [0, 0, '8:00', '8:00', 10],  # 北京南站(始发站)，出发时间0
-        [10, 0, '8:30', '8:30', 10],  # 廊坊站(通过站)，时间点1 
+        [0, 0, '8:00', '8:00', 10],  # 北京南站(始发站) 
+        [70, 0, '8:20', '8:20', 10],  # 廊坊站(通过站) 
     ]
     station_names = {
         0: "北京南",
-        10: "廊坊"
+        70: "廊坊"
     }
-    create_train_schedule_sts_grid(stations, station_names) 
+    create_train_schedule_sts_grid(stations, station_names, max_distance=30, draw_plan=False, draw_line=False) 
