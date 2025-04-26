@@ -546,17 +546,19 @@ def create_valid_arcs(valid_nodes, stations_df, a_max, ax=None, draw_line=False)
                     cost = energy
                     
                     # 考虑与时刻表的一致性
-                    for station in stations_df:
-                        station_pos, station_type, arrive_time, depart_time, _ = station
-                        
-                        if i == station_pos:
-                            # 出发站点，与出发时间比较
-                            time_diff = abs(t - depart_time)
-                            cost += time_diff * 10.0
-                        elif j == station_pos:
-                            # 到达站点，与到达时间比较
-                            time_diff = abs(t+1 - arrive_time)
-                            cost += time_diff * 10.0
+                    # for station in stations_df:
+                    #     station_pos, station_type, arrive_time, depart_time, _ = station
+
+                    # region    
+                    #     if i == station_pos:
+                    #         # 出发站点，与出发时间比较
+                    #         time_diff = abs(t - depart_time)
+                    #         cost += time_diff * 10.0
+                    #     elif j == station_pos:
+                    #         # 到达站点，与到达时间比较
+                    #         time_diff = abs(t+1 - arrive_time)
+                    #         cost += time_diff * 10.0
+                    # endregion
                     
                     # 添加到图中
                     graph[from_node].append((to_node, cost)) 
@@ -624,18 +626,12 @@ def create_train_schedule_sts_grid(stations_df, station_names, delta_d=5,
     # 将站点位置映射到分段后的位置
     station_positions = [int(round(stations_df[i][0])) for i in range(len(stations_df))]    
     
-    fig = plt.figure(figsize=(15, 12))
-    plt.rcParams['font.sans-serif'] = ['SimHei']  # 设置中文字体
-    plt.rcParams['axes.unicode_minus'] = False    # 正常显示负号
-    ax = fig.add_subplot(111, projection='3d')
-    
     # 设置坐标范围
     space_range = np.arange(0, space_segments + 1)
     time_range = np.arange(0, time_nodes+1)
     speed_range = np.arange(0, speed_levels+1)
 
     """============================创建STS网格模型============================="""  
-    print("正在创建STS网格模型...")
     # 创建节点集合
     all_nodes = set()
     for i in space_range:  # 空间维度
@@ -651,6 +647,10 @@ def create_train_schedule_sts_grid(stations_df, station_names, delta_d=5,
         valid_nodes = filter_nodes_near_plan(valid_nodes, stations_df, station_names, max_distance) # 调用函数筛选节点
 
     """======================绘制有效STS网格节点============================="""  
+    fig = plt.figure(figsize=(15, 12))
+    plt.rcParams['font.sans-serif'] = ['SimHei']  # 设置中文字体
+    plt.rcParams['axes.unicode_minus'] = False    # 正常显示负号
+    ax = fig.add_subplot(111, projection='3d')
     plot_sts_grid_nodes(ax, station_names, time_nodes, valid_nodes=valid_nodes)
 
     """============================添加有效弧============================="""  
