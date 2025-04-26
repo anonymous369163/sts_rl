@@ -1,5 +1,9 @@
 """
 本代码用于生成多列车的运行区间STS网格模型，根据给定的多个列车计划时刻表，完成多个列车的最优速度位置曲线的生成
+注意，这个代码是顺序求解的，也就是一个车一个车进行轨迹生成的。
+然后目前的代码里是没有考虑这个电网给机车供电的这个约束的（不过这个约束也是相对比较好加的）
+然后当前的代码里应该也是没有考虑这个站内股道约束的 （这个估计也容易，后面再加，主要是主心骨的代码必须要赶紧编写出来）
+4-24 我现在还需要编写一个能够完成并行求解的代码，也就是说能够一下子完成多个列车时刻表的轨迹生成。
 """
 
 import numpy as np
@@ -235,14 +239,18 @@ def create_multi_train_schedule_sts_grid(train_schedules, station_names_input, d
         # 创建STS网格模型
         print("正在创建STS网格模型...")
         
-        # 创建节点集合
-        all_nodes = set()
-        for i in space_range:  # 空间维度
-            for t in time_range:  # 时间维度
-                for v in speed_range:  # 速度维度
-                    all_nodes.add((i, t, v))
+        # 使用全局变量存储的节点集合，避免每次重复创建
+        if 'global_all_nodes' not in locals():
+            # 第一次创建节点集合
+            global_all_nodes = set()
+            for i in space_range:  # 空间维度
+                for t in time_range:  # 时间维度
+                    for v in speed_range:  # 速度维度
+                        global_all_nodes.add((i, t, v))
+            print(f"初始网格节点总数: {len(global_all_nodes)}")
         
-        print(f"初始网格节点总数: {len(all_nodes)}")
+        # 使用已创建的节点集合
+        all_nodes = global_all_nodes.copy()
         
         # 移除不合理的节点
         valid_nodes_set = set()
@@ -869,19 +877,24 @@ if __name__ == "__main__":
     }
     
     # 调用多列车运行轨迹生成函数
+    import time
+    
+    start_time = time.time()
     results = create_multi_train_schedule_sts_grid(
         train_schedules,
         station_names, 
-        delta_d=5,                # 空间间隔（km）
-        delta_t=5,                # 时间间隔（分钟）
+        delta_d=1,                # 空间间隔（km）   1
+        delta_t=1,                # 时间间隔（分钟）  1
         speed_levels=5,           # 速度级别数量
         time_diff_minutes=4*60+1, # 时间窗口（分钟）
         total_distance=300,       # 线路总长度（km）
-        draw_plan=True,           # 是否绘制计划时刻表
+        draw_plan=False,          # 是否绘制计划时刻表
         draw_line=False,          # 是否绘制弧线（通常设为False以减少图表复杂度）
         max_distance=10,          # 最大距离约束
         min_headway=2             # 最小列车间隔（时间单位）
     )
+    end_time = time.time()
+    print(f"完成所有时刻表的绘制耗时: {end_time - start_time:.2f} 秒")
     
     # 打印最终结果摘要
     if results:
