@@ -17,8 +17,93 @@ from main import (convert_time_to_units, Arrow3D, convert_time_to_minutes, check
                   trans_df_grid, filter_valid_nodes, filter_nodes_near_plan, create_valid_arcs)
 
 
+
+# 验证更新后的乘子是否能够影响所选弧
+def verify_multiplier_impact(new_multipliers, all_selected_arcs, headway):
+    """
+    验证更新后的乘子是否能够影响所选弧
+    
+    参数:
+        new_multipliers: 更新后的拉格朗日乘子字典
+        all_selected_arcs: 所有列车选择的弧
+        headway: 最小间隔时间
+        
+    返回:
+        has_impact: 布尔值，表示乘子是否能够影响所选弧
+        impact_info: 字典，包含影响的详细信息
+    """
+    print(f"验证更新后的乘子是否能够影响所选弧...")
+    
+    # 检查乘子与所选弧的交集
+    multiplier_keys_set = set(new_multipliers.keys())
+    arc_keys_set = set()
+    
+    # 收集所有列车选择的弧的时空位置键
+    for train_idx, selected_arcs in enumerate(all_selected_arcs):
+        print(f"列车 {train_idx} 选择了 {len(selected_arcs)} 条弧")
+        for arc in selected_arcs:
+            i, j, t, s, v_speed, u_speed = arc
+            i_pos, j_pos = min(i, j), max(i, j)
+            
+            # 添加起点和终点时间的键
+            arc_keys_set.add((i_pos, j_pos, t))
+            arc_keys_set.add((i_pos, j_pos, s))
+            
+            # 添加headway范围内的时间点
+            for h in range(1, headway + 1):
+                for time_offset in [-h, h]:
+                    arc_keys_set.add((i_pos, j_pos, t + time_offset))
+                    arc_keys_set.add((i_pos, j_pos, s + time_offset))
+    
+    # 检查乘子与所选弧的交集
+    intersection = multiplier_keys_set.intersection(arc_keys_set)
+    print(f"乘子与所选弧的交集大小: {len(intersection)}")
+    
+    impact_info = {
+        "intersection_size": len(intersection),
+        "has_intersection": len(intersection) > 0,
+        "multiplier_keys_sample": list(multiplier_keys_set)[:5] if multiplier_keys_set else [],
+        "arc_keys_sample": list(arc_keys_set)[:5] if arc_keys_set else [],
+        "intersection_sample": list(intersection)[:5] if intersection else []
+    }
+    
+    # 如果没有交集，输出警告和调试信息
+    if len(intersection) == 0:
+        print("警告: 乘子与所选弧没有交集，这可能导致乘子无法影响路径选择")
+        print(f"乘子样本: {impact_info['multiplier_keys_sample'] if impact_info['multiplier_keys_sample'] else '空'}")
+        print(f"弧键样本: {impact_info['arc_keys_sample'] if impact_info['arc_keys_sample'] else '空'}")
+        
+        # 检查键的格式是否一致
+        if multiplier_keys_set and arc_keys_set:
+            multiplier_key_example = list(multiplier_keys_set)[0]
+            arc_key_example = list(arc_keys_set)[0]
+            print(f"乘子键格式示例: {multiplier_key_example}, 类型: {[type(x) for x in multiplier_key_example]}")
+            print(f"弧键格式示例: {arc_key_example}, 类型: {[type(x) for x in arc_key_example]}")
+            
+            impact_info["multiplier_key_example"] = multiplier_key_example
+            impact_info["arc_key_example"] = arc_key_example
+        
+        return False, impact_info
+    else:
+        print(f"乘子与所选弧有 {len(intersection)} 个交集点，乘子可以影响路径选择")
+        # 输出一些交集样本
+        print(f"交集样本: {impact_info['intersection_sample']}")
+        
+        # 检查这些交集点的乘子值
+        intersection_values = {key: new_multipliers[key] for key in intersection if key in new_multipliers}
+        non_zero_values = {k: v for k, v in intersection_values.items() if v > 0}
+        print(f"交集中非零乘子数量: {len(non_zero_values)}")
+        
+        impact_info["non_zero_count"] = len(non_zero_values)
+        impact_info["non_zero_sample"] = list(non_zero_values.items())[:5] if non_zero_values else []
+        
+        if non_zero_values:
+            print(f"非零乘子样本: {impact_info['non_zero_sample']}")
+        
+        return len(non_zero_values) > 0, impact_info
+
 def find_optimal_path_with_lagrangian(valid_nodes, graph, start_node, end_node, 
-                                     multipliers, incompatible_arcs_dict, train_idx, ax=None):
+                                     multipliers, train_idx, headway, ax=None, drawn_arcs=set()):
     """
     使用带有拉格朗日乘子的Dijkstra算法寻找最优路径
     
@@ -51,7 +136,7 @@ def find_optimal_path_with_lagrangian(valid_nodes, graph, start_node, end_node,
     
     visited_nodes = set() # 用于优化，避免重复处理已确定最短路径的节点
 
-    print(f"列车 {train_idx}：开始使用带拉格朗日乘子的Dijkstra算法寻找最短路径...")
+    print(f"列车 {train_idx}：开始使用带拉格朗日乘子的Dijkstra算法寻找最短路径...") 
     
     while pq:
         # 取出当前距离最小的节点
@@ -84,16 +169,28 @@ def find_optimal_path_with_lagrangian(valid_nodes, graph, start_node, end_node,
                     # 计算拉格朗日惩罚项
                     penalty = 0.0
                     
-                    # 检查起点时间的不兼容集合
-                    start_key = (min(i, j), max(i, j), t)
-                    if start_key in multipliers:
-                        penalty += multipliers[start_key]
+                    # 检查起点时间及其headway范围内的不兼容集合
+                    i_pos, j_pos = min(i, j), max(i, j)
+
+                    arc_keys_set = set()
+                    # 添加起点和终点时间的键
+                    arc_keys_set.add((i_pos, j_pos, t))
+                    arc_keys_set.add((i_pos, j_pos, s))
                     
-                    # 检查终点时间的不兼容集合
-                    end_key = (min(i, j), max(i, j), s)
-                    if end_key in multipliers:
-                        penalty += multipliers[end_key]
-                    
+                    # 添加headway范围内的时间点
+                    for h in range(1, headway + 1):
+                        for time_offset in [-h, h]:
+                            arc_keys_set.add((i_pos, j_pos, t + time_offset))
+                            arc_keys_set.add((i_pos, j_pos, s + time_offset))
+
+                    for arc_key in arc_keys_set:
+                        if arc_key in multipliers:
+                            penalty += multipliers[arc_key] 
+
+                    # 记录加入惩罚的弧
+                    if penalty > 0:
+                        drawn_arcs.add(arc)
+                        
                     # 计算总成本 = 基础成本 + 拉格朗日惩罚
                     total_cost = base_cost + penalty
                     
@@ -127,6 +224,8 @@ def find_optimal_path_with_lagrangian(valid_nodes, graph, start_node, end_node,
                 print(f"列车 {train_idx}：除了起点外，没有其他可达节点。")
             plt.title(f"列车{train_idx} STS网格模型（未找到路径）")
             plt.show()
+        
+        plt.show(block=True)
         return None, dist, prev, []
 
     # 重建最短路径
@@ -151,17 +250,16 @@ def find_optimal_path_with_lagrangian(valid_nodes, graph, start_node, end_node,
     path.reverse()  # 反转路径，从起点到终点
     selected_arcs.reverse()  # 反转弧，与路径匹配
     
-    return path, dist, prev, selected_arcs
+    return path, dist, prev, selected_arcs, ax, drawn_arcs
 
 
-def identify_incompatible_arcs(valid_nodes, graph, headway):
+def identify_incompatible_arcs(graph, headway):
     """
     识别不兼容弧集合，每个弧生成两个不兼容集合：
     1. 以起点时间为键 (i,j,t)
     2. 以终点时间为键 (i,j,s)
     
-    参数:
-        valid_nodes: 有效节点集合
+    参数: 
         graph: 图的邻接表表示
         headway: 最小间隔时间
         
@@ -222,7 +320,7 @@ def identify_incompatible_arcs(valid_nodes, graph, headway):
     return incompatible_arcs_dict
 
 
-def update_multipliers(multipliers, train_paths, incompatible_arcs_dict, step_size, headway):
+def update_multipliers(multipliers, train_paths, step_size, headway):
     """
     使用次梯度法更新拉格朗日乘子
     
@@ -279,6 +377,7 @@ def update_multipliers(multipliers, train_paths, incompatible_arcs_dict, step_si
                     space_time_usage[s_key].append(train_idx)
     
     # 检查冲突并更新乘子
+    conflict_zones = []
     for space_time_key, trains in space_time_usage.items():
         # 如果同一时空位置有多列车使用，则存在冲突
         if len(set(trains)) > 1:
@@ -289,68 +388,247 @@ def update_multipliers(multipliers, train_paths, incompatible_arcs_dict, step_si
             if space_time_key not in new_multipliers:
                 new_multipliers[space_time_key] = 0
             new_multipliers[space_time_key] = max(0, new_multipliers[space_time_key] + step_size * violation)
+
+            i, j, t = space_time_key
+            conflict_zones.append((i, t, len(set(trains))))
     
     # 打印调试信息，检查乘子是否有效影响路径
     print(f"总违反约束数: {total_violations}")
-    print(f"更新的乘子数量: {len(new_multipliers)}")
+    print(f"更新的乘子数量: {len(new_multipliers)}") 
     
-    # 检查乘子是否与路径有交集
-    multiplier_keys_set = set(new_multipliers.keys())
-    path_keys_set = set()
+    return new_multipliers, total_violations, conflict_zones
+
+
+def visualize_penalized_arcs(graph, multipliers, headway, ax):
+    """
+    可视化三维空间中已经加入惩罚的弧
     
-    # 收集所有路径中使用的时空位置键
-    for train_idx, train_arcs in enumerate(train_paths):
-        for arc in train_arcs:
-            i, j, t, s, _, _ = arc
-            i_pos, j_pos = min(i, j), max(i, j)
-            path_keys_set.add((i_pos, j_pos, t))
-            path_keys_set.add((i_pos, j_pos, s))
+    参数:
+        graph: 图的邻接表表示
+        multipliers: 拉格朗日乘子字典
+        ax: 3D绘图对象
+    """
+    penalized_arcs = []
+    
+    # 遍历所有弧，检查是否有惩罚
+    for u in graph:
+        for v, base_cost in graph[u]:
+            i, t, v_speed = u
+            j, s, u_speed = v
             
-            # 添加与不兼容弧集合构建时相同的headway范围
-            for h in range(1, headway + 1):
-                for time_offset in [-h, h]:
-                    path_keys_set.add((i_pos, j_pos, t + time_offset))
-                    path_keys_set.add((i_pos, j_pos, s + time_offset))
+            # 检查弧是否与乘子位置相关（考虑headway）
+            for h in range(headway + 1):
+                for time_offset in range(-h, h+1):
+                    t_key = (min(i, j), max(i, j), t + time_offset)
+                    s_key = (min(i, j), max(i, j), s + time_offset)
+                    
+                    if t_key in multipliers and multipliers[t_key] > 0:
+                        # 标记为惩罚弧
+                        penalized_arcs.append((u, v, multipliers[t_key], 'start'))
+                    if s_key in multipliers and multipliers[s_key] > 0:
+                        # 标记为惩罚弧
+                        penalized_arcs.append((u, v, multipliers[s_key], 'end'))
     
-    # 检查交集
-    intersection = multiplier_keys_set.intersection(path_keys_set)
-    print(f"乘子与路径的交集大小: {len(intersection)}")
-    if len(intersection) == 0:
-        print("警告: 乘子与路径没有交集，这可能导致乘子无法影响最优路径选择")
-        # 输出一些乘子和路径的样本以便调试
-        print(f"乘子样本: {list(multiplier_keys_set)[:5] if multiplier_keys_set else '空'}")
-        print(f"路径键样本: {list(path_keys_set)[:5] if path_keys_set else '空'}")
+    print(f"找到 {len(penalized_arcs)} 条带惩罚的弧")
+    
+    if not penalized_arcs:
+        print("没有找到带惩罚的弧，可能是因为乘子全为零或者位置键与弧不匹配")
+        return
+    
+    # 绘制带惩罚的弧
+    for arc_info in penalized_arcs:
+        u, v, penalty, pos_type = arc_info
+        i, t, v_speed = u
+        j, s, u_speed = v
         
-        # 检查键的格式是否一致
-        if multiplier_keys_set and path_keys_set:
-            multiplier_key_example = list(multiplier_keys_set)[0]
-            path_key_example = list(path_keys_set)[0]
-            print(f"乘子键格式示例: {multiplier_key_example}, 类型: {[type(x) for x in multiplier_key_example]}")
-            print(f"路径键格式示例: {path_key_example}, 类型: {[type(x) for x in path_key_example]}")
-            
-            # 如果发现类型不匹配，尝试转换
-            if any(type(a) != type(b) for a, b in zip(multiplier_key_example, path_key_example)):
-                print("发现类型不匹配，尝试转换...")
-                # 转换乘子键类型
-                converted_multipliers = {}
-                for key, value in new_multipliers.items():
-                    converted_key = tuple(int(k) if isinstance(k, (int, float)) else k for k in key)
-                    converted_multipliers[converted_key] = value
-                new_multipliers = converted_multipliers
-                
-                # 重新检查交集
-                multiplier_keys_set = set(new_multipliers.keys())
-                converted_path_keys = set(tuple(int(k) if isinstance(k, (int, float)) else k for k in key) for key in path_keys_set)
-                intersection = multiplier_keys_set.intersection(converted_path_keys)
-                print(f"类型转换后的交集大小: {len(intersection)}")
+        # 设置弧的颜色，强度由惩罚值决定
+        alpha = min(1.0, penalty / 10)  # 将惩罚值映射到0-1的透明度
+        line_width = 1 + penalty / 5  # 惩罚值越大，线越粗
+        
+        # 绘制3D弧
+        ax.plot([i, j], [t, s], [v_speed, u_speed], 
+                color='red', alpha=alpha, linewidth=line_width)
+        
+        # 在弧的中点添加标记表示惩罚值
+        mid_i = (i + j) / 2
+        mid_t = (t + s) / 2
+        mid_v = (v_speed + u_speed) / 2
+        
+        # 使用文本标签显示惩罚值
+        if penalty > 1:  # 只显示显著的惩罚
+            ax.text(mid_i, mid_t, mid_v, f"{penalty:.1f}", 
+                    color='black', fontsize=8, 
+                    bbox=dict(facecolor='white', alpha=0.7))
+
+
+def plot_penalty_distribution(multipliers_history, ax=None):
+    """
+    绘制迭代过程中惩罚分布的变化
     
-    return new_multipliers, total_violations
+    参数:
+        multipliers_history: 迭代过程中记录的乘子历史
+        ax: 可选的绘图对象
+    """
+    if ax is None:
+        fig = plt.figure(figsize=(10, 6))
+        ax = fig.add_subplot(111)
+    
+    # 获取所有迭代中的最大乘子值
+    max_multiplier = 0
+    for mult_dict in multipliers_history:
+        if mult_dict:
+            max_multiplier = max(max_multiplier, max(mult_dict.values()))
+    
+    # 创建颜色映射
+    cmap = plt.cm.get_cmap('viridis')
+    
+    # 为每次迭代绘制一条线
+    for i, mult_dict in enumerate(multipliers_history):
+        if not mult_dict:
+            continue
+        
+        # 按值排序的乘子
+        sorted_values = sorted(mult_dict.values(), reverse=True)
+        
+        # 绘制分布曲线
+        color = cmap(i / len(multipliers_history))
+        ax.plot(range(len(sorted_values)), sorted_values, 
+                color=color, alpha=0.7, label=f'迭代 {i+1}')
+    
+    ax.set_xlabel('乘子索引 (按值降序排列)')
+    ax.set_ylabel('乘子值')
+    ax.set_title('惩罚分布的迭代变化')
+    ax.legend()
+    
+    return ax
+
+
+def visualize_path_violations(best_paths, best_selected_arcs, headway, ax):
+    """
+    可视化最优路径中违反约束的部分
+    
+    参数:
+        best_paths: 最优路径列表
+        best_selected_arcs: 最优路径对应的弧列表
+        headway: 最小间隔时间
+        ax: 3D绘图对象
+    """
+    # 创建时空位置使用字典
+    space_time_usage = {}
+    
+    # 记录每个列车的弧使用情况
+    train_arcs_dict = {}
+    
+    # 收集所有列车使用的时空位置
+    for train_idx, arcs in enumerate(best_selected_arcs):
+        train_arcs_dict[train_idx] = arcs
+        for arc in arcs:
+            i, j, t, s, v_speed, u_speed = arc
+            i_pos, j_pos = min(i, j), max(i, j)
+            
+            # 记录起点时间位置
+            start_key = (i_pos, j_pos, t)
+            if start_key not in space_time_usage:
+                space_time_usage[start_key] = []
+            space_time_usage[start_key].append(train_idx)
+            
+            # 记录终点时间位置
+            end_key = (i_pos, j_pos, s)
+            if end_key not in space_time_usage:
+                space_time_usage[end_key] = []
+            space_time_usage[end_key].append(train_idx)
+            
+            # 添加headway范围内的时间点
+            for h in range(1, headway + 1):
+                # 起点时间前后的时间点
+                for time_offset in [-h, h]:
+                    t_offset = t + time_offset
+                    t_key = (i_pos, j_pos, t_offset)
+                    if t_key not in space_time_usage:
+                        space_time_usage[t_key] = []
+                    space_time_usage[t_key].append(train_idx)
+                
+                # 终点时间前后的时间点
+                for time_offset in [-h, h]:
+                    s_offset = s + time_offset
+                    s_key = (i_pos, j_pos, s_offset)
+                    if s_key not in space_time_usage:
+                        space_time_usage[s_key] = []
+                    space_time_usage[s_key].append(train_idx)
+    
+    # 找出冲突的时空位置
+    conflict_positions = {}
+    for space_time_key, trains in space_time_usage.items():
+        if len(set(trains)) > 1:
+            conflict_positions[space_time_key] = list(set(trains))
+    
+    # 找出对应的弧并可视化
+    visualized_conflicts = set()  # 避免重复可视化
+    
+    if not conflict_positions:
+        print("没有找到路径冲突！所有列车路径满足约束。")
+        return
+    
+    print(f"找到 {len(conflict_positions)} 个冲突时空位置")
+    
+    # 绘制冲突区域和相应的列车弧
+    for space_time_key, conflicting_trains in conflict_positions.items():
+        i, j, t = space_time_key
+        
+        # 在图中标记冲突位置
+        conflict_intensity = len(conflicting_trains)
+        ax.scatter(i, t, 0, 
+                   c='red', s=100+conflict_intensity*20, 
+                   marker='x', alpha=0.7, zorder=10)
+        
+        # 为每个冲突列车找到对应的弧
+        for train_idx in conflicting_trains:
+            if train_idx not in train_arcs_dict:
+                continue
+                
+            for arc in train_arcs_dict[train_idx]:
+                arc_i, arc_j, arc_t, arc_s, v_speed, u_speed = arc
+                arc_i_pos, arc_j_pos = min(arc_i, arc_j), max(arc_i, arc_j)
+                
+                # 检查弧是否与冲突位置相关
+                if ((arc_i_pos == i and arc_j_pos == j) or (arc_i_pos == j and arc_j_pos == i)) and \
+                   ((abs(arc_t - t) <= headway) or (abs(arc_s - t) <= headway)):
+                    
+                    # 创建唯一标识以避免重复绘制
+                    conflict_id = (arc_i, arc_j, arc_t, arc_s, train_idx)
+                    if conflict_id in visualized_conflicts:
+                        continue
+                    visualized_conflicts.add(conflict_id)
+                    
+                    # 高亮显示冲突弧
+                    ax.plot([arc_i, arc_j], [arc_t, arc_s], [v_speed, u_speed], 
+                            color=f'C{train_idx}', linewidth=4, linestyle=':', alpha=0.9,
+                            zorder=5)
+                    
+                    # 添加冲突说明
+                    mid_i = (arc_i + arc_j) / 2
+                    mid_t = (arc_t + arc_s) / 2
+                    mid_v = (v_speed + u_speed) / 2
+                    
+                    ax.text(mid_i, mid_t, mid_v, f"列车{train_idx}冲突", 
+                            color=f'C{train_idx}', fontsize=10, 
+                            bbox=dict(facecolor='white', alpha=0.7))
+    
+    # 添加冲突图例
+    ax.scatter([], [], [], c='red', s=120, marker='x', 
+               label='冲突时空位置')
+    
+    for train_idx in range(len(best_paths)):
+        ax.plot([], [], [], color=f'C{train_idx}', linewidth=4, linestyle=':', 
+                label=f'列车{train_idx}冲突弧')
+    
+    ax.legend(loc='upper left')
 
 
 def solve_multi_train_with_lagrangian(train_schedules, station_names, delta_d=5, delta_t=5, 
                                       speed_levels=5, time_diff_minutes=5*60, total_distance=50,
                                       max_distance=30, select_near_plan=True, a_max=5,
-                                      train_max_speed=5, headway=2, max_iterations=50):
+                                      train_max_speed=5, headway=2, max_iterations=50, debug_mode=False):
     """
     使用拉格朗日松弛法求解多列车时刻表问题
     
@@ -451,7 +729,7 @@ def solve_multi_train_with_lagrangian(train_schedules, station_names, delta_d=5,
         # valid_z = [node[2] for node in valid_nodes]
         # ax.scatter(valid_x, valid_y, valid_z, color=node_color, s=10, alpha=0.3, label=f'列车{train_idx}有效节点')
         # endregion
-    
+
     # 设置图例和标题
     ax.legend()
     ax.set_title('多列车STS网格模型可视化')
@@ -459,16 +737,17 @@ def solve_multi_train_with_lagrangian(train_schedules, station_names, delta_d=5,
     ax.set_ylabel('时间维度 (时间/min)')
     ax.set_zlabel('速度维度 (速度/km/min)')
     
-    # 识别所有列车的不兼容弧集合
-    all_incompatible_arcs_dict = []
-    for train_idx, graph in enumerate(train_graphs):
-        print(f"计算列车 {train_idx} 的不兼容弧集合...")
-        incompatible_arcs_dict = identify_incompatible_arcs(train_valid_nodes[train_idx], graph, headway)
-        all_incompatible_arcs_dict.append(incompatible_arcs_dict)
-    
+    # region 识别所有列车的不兼容弧集合
+    # all_incompatible_arcs_dict = []
+    # for train_idx, graph in enumerate(train_graphs):
+    #     print(f"计算列车 {train_idx} 的不兼容弧集合...")
+    #     incompatible_arcs_dict = identify_incompatible_arcs(graph, headway)
+    #     all_incompatible_arcs_dict.append(incompatible_arcs_dict)
+    # endregion
+
     # 拉格朗日乘子迭代求解
     multipliers = {}  # 初始化拉格朗日乘子为0
-    step_size = 10.0   # 初始步长
+    step_size = 100.  # 增大初始步长加快乘子增长
     
     best_paths = None
     best_violations = float('inf')
@@ -482,6 +761,10 @@ def solve_multi_train_with_lagrangian(train_schedules, station_names, delta_d=5,
     
     print("开始拉格朗日松弛迭代...")
     
+    # 初始化乘子历史记录 
+    drawn_arcs = set()
+    multipliers_history = []
+
     for iteration in range(max_iterations):
         print(f"\n迭代 {iteration + 1}/{max_iterations}")
         
@@ -493,8 +776,8 @@ def solve_multi_train_with_lagrangian(train_schedules, station_names, delta_d=5,
             start_node, end_node = train_start_end_nodes[train_idx]
             
             # 使用拉格朗日乘子寻找最短路径
-            path, dist, prev, selected_arcs = find_optimal_path_with_lagrangian(
-                valid_nodes, graph, start_node, end_node, multipliers, all_incompatible_arcs_dict[train_idx], train_idx)
+            path, dist, prev, selected_arcs, ax, drawn_arcs = find_optimal_path_with_lagrangian(
+                valid_nodes, graph, start_node, end_node, multipliers, train_idx, headway, ax, drawn_arcs)
             
             if path is None:
                 print(f"列车 {train_idx} 无法找到路径，跳过当前迭代")
@@ -512,43 +795,42 @@ def solve_multi_train_with_lagrangian(train_schedules, station_names, delta_d=5,
                 print("步长过小，停止迭代")
                 break
             continue
+
+        if iteration == max_iterations - 1 and debug_mode:  # 最后一次迭代时可视化
+            print("可视化带惩罚的弧...") 
+            
+            # 遍历所有已记录的弧
+            penalty_arcs_count = 0
+            for arc_key in drawn_arcs:
+                # 获取弧的起点和终点坐标
+                i, j, t, s, v_speed, u_speed = arc_key
+                start_point = (i, t, v_speed)
+                end_point = (j, s, u_speed)
+                # 绘制紫色线条表示带惩罚的弧
+                ax.plot([start_point[0], end_point[0]], 
+                        [start_point[1], end_point[1]], 
+                        [start_point[2], end_point[2]], 
+                        color='purple', linewidth=4, alpha=0.7)
+                penalty_arcs_count += 1 
+                    
+            print(f"共绘制了 {penalty_arcs_count} 条带惩罚的弧")
         
         # 更新拉格朗日乘子
-        new_multipliers, violations = update_multipliers(
-            multipliers, all_selected_arcs, all_incompatible_arcs_dict[0], step_size, headway)
+        new_multipliers, violations, conflict_zones = update_multipliers(multipliers, all_selected_arcs, step_size, headway)
         
-        # 标记multipliers所包含的节点
-        if iteration == max_iterations - 1:  # 只在最后一次迭代时绘制
-            print(f"正在标记第 {iteration + 1} 次迭代中的乘子节点...")
-            multiplier_nodes_marked = False
-            
-            # 收集所有乘子节点
-            multiplier_nodes = []
-            for key, value in new_multipliers.items():
-                if value > 0:  # 只标记正值乘子
-                    i, j, t = key
-                    # 在空间-时间平面上标记
-                    multiplier_nodes.append((i, t, 0))  # 速度维度设为0以便在底部平面显示
-            
-            if multiplier_nodes:
-                # 绘制乘子节点
-                multiplier_nodes = np.array(multiplier_nodes)
-                ax.scatter(
-                    multiplier_nodes[:, 0], 
-                    multiplier_nodes[:, 1], 
-                    multiplier_nodes[:, 2],
-                    color='red', s=80, marker='x', alpha=0.7,
-                    label=f'迭代{iteration+1}乘子节点({len(multiplier_nodes)}个)'
-                )
-                multiplier_nodes_marked = True
-                print(f"已标记 {len(multiplier_nodes)} 个乘子节点")
-            
-            if not multiplier_nodes_marked:
-                print("没有找到需要标记的乘子节点")
+        if iteration == max_iterations - 1 and debug_mode:
+            # 在绘图时标记冲突区域
+            if conflict_zones:
+                conflict_data = np.array(conflict_zones)
+                sc = ax.scatter(conflict_data[:, 0], conflict_data[:, 1], 
+                            np.zeros_like(conflict_data[:, 2]), 
+                            c=conflict_data[:, 2], cmap='plasma',
+                            s=100, marker='o', edgecolors='black',
+                            label='列车冲突区域')
+                plt.colorbar(sc, ax=ax, label='冲突列车数')
         
         print(f"约束违反数: {violations}")
         print(f"乘子数量: {len(new_multipliers)}")
-        
         
         # 保存最佳解
         if violations < best_violations:
@@ -558,14 +840,20 @@ def solve_multi_train_with_lagrangian(train_schedules, station_names, delta_d=5,
         
         # 检查终止条件
         if violations == 0:
-            print("找到无冲突解，停止迭代")
-            break
+            print("找到无冲突解，但继续迭代以优化解")
+            # 当没有冲突时，减少乘子的罚值，使算法能够探索更多可能的解
+            for key in multipliers:
+                multipliers[key] *= 0.5  # 将所有乘子的值减半
+            print("已将所有乘子的罚值减半，以便探索更优解")
         
         # 更新乘子和步长
         multipliers = new_multipliers
         if iteration % 10 == 9:  # 每10次迭代调整步长
             step_size *= 0.8
             print(f"调整步长至 {step_size}")
+        
+        # 更新乘子后记录到历史
+        multipliers_history.append(copy.deepcopy(new_multipliers))
     
     end_time = time.time()
     print(f"\n拉格朗日松弛求解完成，耗时 {end_time - start_time:.2f} 秒")
@@ -592,8 +880,33 @@ def solve_multi_train_with_lagrangian(train_schedules, station_names, delta_d=5,
             # 绘制在空间-时间平面的投影
             ax.plot(path_space, path_time, np.zeros_like(path_speed), 
                     color=train_color, linewidth=2, linestyle='--', alpha=0.7)
+    if debug_mode:
+        # 绘制惩罚分布变化
+        fig_penalty = plt.figure(figsize=(10, 6))
+        ax_penalty = fig_penalty.add_subplot(111)
+        plot_penalty_distribution(multipliers_history, ax_penalty)
+        plt.savefig('penalty_distribution.png')
     
-    # 完善图形显示
+    # 绘制最终结果后，可视化路径违反情况
+    # if best_paths and best_violations > 0:
+    #     print("可视化路径冲突...")
+    #     # 获取最佳路径对应的弧
+    #     best_selected_arcs = []
+    #     for train_idx, path in enumerate(best_paths):
+    #         # 重建路径对应的弧
+    #         selected_arcs = []
+    #         for i in range(len(path) - 1):
+    #             prev_node = path[i]
+    #             next_node = path[i+1]
+    #             i, t, v_speed = prev_node
+    #             j, s, u_speed = next_node
+    #             arc = (i, j, t, s, v_speed, u_speed)
+    #             selected_arcs.append(arc)
+    #         best_selected_arcs.append(selected_arcs)
+        
+    #     # 可视化路径冲突
+    #     visualize_path_violations(best_paths, best_selected_arcs, headway, ax)
+            # 完善图形显示
     finalize_plot(ax, space_segments, time_nodes, speed_levels, delta_d, delta_t)
     
     return best_paths
@@ -643,16 +956,18 @@ if __name__ == "__main__":
     # 执行算法
     best_paths = solve_multi_train_with_lagrangian(
         [train_schedule1, train_schedule2, train_schedule3, train_schedule4], 
+        # [train_schedule2, train_schedule3], 
         station_names,
-        delta_d=1,      # 200米
-        delta_t=1,      # 0.2分钟 12秒
+        delta_d=1,      # 500米
+        delta_t=1,      # 0.5分钟 30秒
         speed_levels=5, 
         time_diff_minutes=2*60,   # 调度范围是2个小时
         total_distance=300,    # 300km的线路
-        max_distance=10,       # 25个格子
+        max_distance=30,       # 25个格子
         headway=2,             # 2个时间单位的最小间隔
-        max_iterations=2,      # 最多迭代50次
+        max_iterations=10,      # 最多迭代50次
         select_near_plan=True,  # 是否使用计划表完成有效点的筛选
+        debug_mode=False,        # 是否开启调试模式
     )
     
     # 计算并输出算法运行时间

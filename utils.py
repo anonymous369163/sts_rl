@@ -194,7 +194,7 @@ def finalize_plot(ax, space_segments, time_nodes, speed_levels, delta_d, delta_t
     ax.set_ylabel('时间')
     ax.set_zlabel('速度 (km/h)')
     
-    plt.tight_layout() 
+    # plt.tight_layout() 
     plt.show()              
 
 
