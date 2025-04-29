@@ -12,9 +12,11 @@ import math
 import heapq
 import copy
 import time
+import concurrent.futures
 from utils import plot_sts_grid_nodes, draw_plan_on_sts_grid, finalize_plot, plot_optimal_path, export_train_schedule
 from main import (convert_time_to_units, Arrow3D, convert_time_to_minutes, check_time_nodes_and_space_segments,
                   trans_df_grid, filter_valid_nodes, filter_nodes_near_plan, create_valid_arcs)
+from optimize_create_arcs import batch_create_valid_arcs
 
 
 
@@ -171,21 +173,16 @@ def find_optimal_path_with_lagrangian(valid_nodes, graph, start_node, end_node,
                     
                     # 检查起点时间及其headway范围内的不兼容集合
                     i_pos, j_pos = min(i, j), max(i, j)
-
-                    arc_keys_set = set()
-                    # 添加起点和终点时间的键
-                    arc_keys_set.add((i_pos, j_pos, t))
-                    arc_keys_set.add((i_pos, j_pos, s))
                     
-                    # 添加headway范围内的时间点
-                    for h in range(1, headway + 1):
-                        for time_offset in [-h, h]:
-                            arc_keys_set.add((i_pos, j_pos, t + time_offset))
-                            arc_keys_set.add((i_pos, j_pos, s + time_offset))
-
-                    for arc_key in arc_keys_set:
-                        if arc_key in multipliers:
-                            penalty += multipliers[arc_key] 
+                    # 只根据当前弧的起点和终点时间添加惩罚
+                    start_key = (i_pos, j_pos, t)
+                    end_key = (i_pos, j_pos, s)
+                    
+                    # 检查并添加惩罚
+                    if start_key in multipliers:
+                        penalty += multipliers[start_key]
+                    if end_key in multipliers:
+                        penalty += multipliers[end_key]
 
                     # 记录加入惩罚的弧
                     if penalty > 0:
@@ -251,6 +248,24 @@ def find_optimal_path_with_lagrangian(valid_nodes, graph, start_node, end_node,
     selected_arcs.reverse()  # 反转弧，与路径匹配
     
     return path, dist, prev, selected_arcs, ax, drawn_arcs
+
+from main import enhanced_filter_valid_nodes
+# 定义处理单个列车的函数
+def process_single_train(train_idx, train_schedule, all_nodes, train_max_speed, select_near_plan, station_names, max_distance, a_max):
+    # 筛选单个列车的有效节点
+    station_positions = [int(round(station[0])) for station in train_schedule]
+    valid_nodes = filter_valid_nodes(all_nodes, station_positions, train_schedule, train_max_speed)
+    
+    if select_near_plan:
+        print(f"列车 {train_idx}：根据计划时刻表筛选节点...")
+        valid_nodes = filter_nodes_near_plan(valid_nodes, train_schedule, station_names, max_distance)
+    
+    # 创建图结构
+    graph, len_valid_arcs = create_valid_arcs(valid_nodes, train_schedule, a_max)
+    # graph, len_valid_arcs = batch_create_valid_arcs(valid_nodes, train_schedule, a_max)
+    print(f"列车 {train_idx}：添加的有效弧数量: {len_valid_arcs}")
+    
+    return train_idx, valid_nodes, graph, len_valid_arcs
 
 
 def identify_incompatible_arcs(graph, headway):
@@ -334,7 +349,8 @@ def update_multipliers(multipliers, train_paths, step_size, headway):
         new_multipliers: 更新后的拉格朗日乘子
         total_violations: 约束违反总数
     """
-    new_multipliers = copy.deepcopy(multipliers)
+    # new_multipliers = copy.deepcopy(multipliers)
+    new_multipliers = multipliers
     total_violations = 0
     
     # 创建每个时空位置(i,j,τ)上的列车使用情况
@@ -393,7 +409,7 @@ def update_multipliers(multipliers, train_paths, step_size, headway):
             conflict_zones.append((i, t, len(set(trains))))
     
     # 打印调试信息，检查乘子是否有效影响路径
-    print(f"总违反约束数: {total_violations}")
+    print(f"总违反约束数: {total_violations}")  
     print(f"更新的乘子数量: {len(new_multipliers)}") 
     
     return new_multipliers, total_violations, conflict_zones
@@ -624,7 +640,7 @@ def visualize_path_violations(best_paths, best_selected_arcs, headway, ax):
     
     ax.legend(loc='upper left')
 
-
+import os
 def solve_multi_train_with_lagrangian(train_schedules, station_names, delta_d=5, delta_t=5, 
                                       speed_levels=5, time_diff_minutes=5*60, total_distance=50,
                                       max_distance=30, select_near_plan=True, a_max=5,
@@ -706,29 +722,58 @@ def solve_multi_train_with_lagrangian(train_schedules, station_names, delta_d=5,
     # 调整视角使图形更容易查看
     ax.view_init(elev=30, azim=45)  # 设置仰角和方位角
     
-    for train_idx, train_schedule in enumerate(train_schedules):
-        # 筛选单个列车的有效节点
-        station_positions = [int(round(station[0])) for station in train_schedule]
-        valid_nodes = filter_valid_nodes(all_nodes, station_positions, train_schedule, train_max_speed)
+    # 使用线程池并行处理所有列车 根据系统CPU核心数自动调整线程数，但最大不超过8个线程
+    num_workers = min(os.cpu_count(), 16) if os.cpu_count() else 4
+    print(f"当前系统使用 {num_workers} 个线程进行并行计算")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+        # 提交所有任务到线程池
+        future_to_train = {
+            executor.submit(
+                process_single_train, 
+                train_idx, 
+                train_schedule, 
+                all_nodes, 
+                train_max_speed, 
+                select_near_plan, 
+                station_names, 
+                max_distance, 
+                a_max
+            ): train_idx 
+            for train_idx, train_schedule in enumerate(train_schedules)
+        }
         
-        if select_near_plan:
-            print(f"列车 {train_idx}：根据计划时刻表筛选节点...")
-            valid_nodes = filter_nodes_near_plan(valid_nodes, train_schedule, station_names, max_distance)
+        # 收集结果并保持原有顺序
+        results = [None] * len(train_schedules)
+        for future in concurrent.futures.as_completed(future_to_train):
+            train_idx, valid_nodes, graph, _ = future.result()
+            train_valid_nodes.append(valid_nodes)
+            train_graphs.append(graph)
+            results[train_idx] = (valid_nodes, graph)
         
-        train_valid_nodes.append(valid_nodes)
+        # 确保结果按列车索引顺序排列
+        train_valid_nodes = []
+        train_graphs = []
+        for valid_nodes, graph in results:
+            train_valid_nodes.append(valid_nodes)
+            train_graphs.append(graph)
+    
+    # region 单线程处理
+    # for train_idx, train_schedule in enumerate(train_schedules):
+    #     # 筛选单个列车的有效节点
+    #     station_positions = [int(round(station[0])) for station in train_schedule]
+    #     valid_nodes = filter_valid_nodes(all_nodes, station_positions, train_schedule, train_max_speed)
         
-        # 创建图结构
-        graph, len_valid_arcs = create_valid_arcs(valid_nodes, train_schedule, a_max)
-        print(f"列车 {train_idx}：添加的有效弧数量: {len_valid_arcs}")
-        train_graphs.append(graph)
+    #     if select_near_plan:
+    #         print(f"列车 {train_idx}：根据计划时刻表筛选节点...")
+    #         valid_nodes = filter_nodes_near_plan(valid_nodes, train_schedule, station_names, max_distance)
         
-        # region 绘制有效节点
-        # node_color = f'C{train_idx}'
-        # valid_x = [node[0] for node in valid_nodes]
-        # valid_y = [node[1] for node in valid_nodes]
-        # valid_z = [node[2] for node in valid_nodes]
-        # ax.scatter(valid_x, valid_y, valid_z, color=node_color, s=10, alpha=0.3, label=f'列车{train_idx}有效节点')
-        # endregion
+    #     train_valid_nodes.append(valid_nodes)
+        
+    #     # 创建图结构
+    #     graph, len_valid_arcs = spatial_index_create_valid_arcs(valid_nodes, train_schedule, a_max)
+    #     print(f"列车 {train_idx}：添加的有效弧数量: {len_valid_arcs}")
+    #     train_graphs.append(graph) 
+    # endregion
 
     # 设置图例和标题
     ax.legend()
@@ -914,38 +959,166 @@ def solve_multi_train_with_lagrangian(train_schedules, station_names, delta_d=5,
 
 if __name__ == "__main__":
     # 定义两个列车的时刻表
+    # 定义更复杂的列车时刻表，增加列车数量和站点数量
     train_schedule1 = [
-        [0, 0, '8:00', '8:00', 4],  # 北京南站(始发站) 
-        [70, 2, '8:20', '8:25', 4],  # 廊坊站(停靠站) 
-        [140, 1, '9:00', '9:00', 4],  # 天津站(通过站)
-        [200, 0, '9:30', '9:30', 4],  # 滨海站(终点站)
+        [0, 0, '8:00', '8:00', 4],      # 北京南站(始发站) 
+        [40, 1, '8:12', '8:12', 4],     # 固安站(通过站)
+        [70, 2, '8:20', '8:25', 4],     # 廊坊站(停靠站) 
+        [100, 1, '8:35', '8:35', 4],    # 胜芳站(通过站)
+        [140, 2, '8:50', '8:55', 4],    # 天津站(停靠站)
+        [170, 1, '9:10', '9:10', 4],    # 塘沽站(通过站)
+        [200, 0, '9:30', '9:30', 4],    # 滨海站(终点站)
     ]
     
     train_schedule2 = [
-        [0, 0, '8:10', '8:10', 4],  # 北京南站(始发站) 
-        [70, 1, '8:30', '8:30', 4],  # 廊坊站(通过站) 
-        [140, 2, '9:05', '9:10', 4],  # 天津站(停靠站)
-        [200, 0, '9:40', '9:40', 4],  # 滨海站(终点站)
+        [0, 0, '8:10', '8:10', 4],      # 北京南站(始发站) 
+        [40, 1, '8:20', '8:20', 4],     # 固安站(通过站)
+        [70, 2, '8:28', '8:33', 4],     # 廊坊站(停靠站) 
+        [100, 1, '8:45', '8:45', 4],    # 胜芳站(通过站)
+        [140, 2, '9:00', '9:05', 4],    # 天津站(停靠站)
+        [170, 1, '9:18', '9:18', 4],    # 塘沽站(通过站)
+        [200, 0, '9:40', '9:40', 4],    # 滨海站(终点站)
     ]
     
     train_schedule3 = [
-        [0, 0, '8:20', '8:20', 4],  # 北京南站(始发站) 
-        [70, 2, '8:40', '8:45', 4],  # 廊坊站(停靠站) 
-        [140, 1, '9:15', '9:15', 4],  # 天津站(通过站)
-        [200, 0, '9:50', '9:50', 4],  # 滨海站(终点站)
+        [0, 0, '8:20', '8:20', 4],      # 北京南站(始发站) 
+        [40, 1, '8:35', '8:35', 4],     # 固安站(通过站)
+        [70, 2, '8:43', '8:48', 4],     # 廊坊站(停靠站) 
+        [100, 1, '8:55', '8:55', 4],    # 胜芳站(通过站)
+        [140, 2, '9:10', '9:15', 4],    # 天津站(停靠站)
+        [170, 1, '9:32', '9:32', 4],    # 塘沽站(通过站)
+        [200, 0, '9:50', '9:50', 4],    # 滨海站(终点站)
     ]
     
     train_schedule4 = [
-        [0, 0, '8:30', '8:30', 4],  # 北京南站(始发站) 
-        [70, 1, '8:50', '8:50', 4],  # 廊坊站(通过站) 
-        [140, 2, '9:25', '9:30', 4],  # 天津站(停靠站)
+        [0, 0, '8:30', '8:30', 4],      # 北京南站(始发站) 
+        [40, 1, '8:40', '8:40', 4],     # 固安站(通过站)
+        [70, 2, '8:48', '8:53', 4],     # 廊坊站(停靠站) 
+        [100, 1, '9:05', '9:05', 4],    # 胜芳站(通过站)
+        [140, 2, '9:20', '9:25', 4],    # 天津站(停靠站)
+        [170, 1, '9:38', '9:38', 4],    # 塘沽站(通过站)
         [200, 0, '10:00', '10:00', 4],  # 滨海站(终点站)
     ]
     
+    train_schedule5 = [
+        [0, 0, '8:40', '8:40', 4],      # 北京南站(始发站) 
+        [40, 1, '8:55', '8:55', 4],     # 固安站(通过站)
+        [70, 2, '9:03', '9:08', 4],     # 廊坊站(停靠站) 
+        [100, 1, '9:15', '9:15', 4],    # 胜芳站(通过站)
+        [140, 2, '9:30', '9:35', 4],    # 天津站(停靠站)
+        [170, 1, '9:52', '9:52', 4],    # 塘沽站(通过站)
+        [200, 0, '10:10', '10:10', 4],  # 滨海站(终点站)
+    ]
+    
+    train_schedule6 = [
+        [0, 0, '8:50', '8:50', 4],      # 北京南站(始发站) 
+        [40, 1, '9:00', '9:00', 4],     # 固安站(通过站)
+        [70, 2, '9:08', '9:13', 4],     # 廊坊站(停靠站) 
+        [100, 1, '9:25', '9:25', 4],    # 胜芳站(通过站)
+        [140, 2, '9:40', '9:45', 4],    # 天津站(停靠站)
+        [170, 1, '9:58', '9:58', 4],    # 塘沽站(通过站)
+        [200, 0, '10:20', '10:20', 4],  # 滨海站(终点站)
+    ]
+    
+    train_schedule7 = [
+        [0, 0, '9:00', '9:00', 4],      # 北京南站(始发站) 
+        [40, 1, '9:15', '9:15', 4],     # 固安站(通过站)
+        [70, 2, '9:23', '9:28', 4],     # 廊坊站(停靠站) 
+        [100, 1, '9:35', '9:35', 4],    # 胜芳站(通过站)
+        [140, 2, '9:50', '9:55', 4],    # 天津站(停靠站)
+        [170, 1, '10:12', '10:12', 4],  # 塘沽站(通过站)
+        [200, 0, '10:30', '10:30', 4],  # 滨海站(终点站)
+    ]
+    
+    train_schedule8 = [
+        [0, 0, '9:10', '9:10', 4],      # 北京南站(始发站) 
+        [40, 1, '9:20', '9:20', 4],     # 固安站(通过站)
+        [70, 2, '9:28', '9:33', 4],     # 廊坊站(停靠站) 
+        [100, 1, '9:45', '9:45', 4],    # 胜芳站(通过站)
+        [140, 2, '10:00', '10:05', 4],  # 天津站(停靠站)
+        [170, 1, '10:18', '10:18', 4],  # 塘沽站(通过站)
+        [200, 0, '10:40', '10:40', 4],  # 滨海站(终点站)
+    ]
+    
+    train_schedule9 = [
+        [0, 0, '9:20', '9:20', 4],      # 北京南站(始发站) 
+        [40, 1, '9:35', '9:35', 4],     # 固安站(通过站)
+        [70, 2, '9:43', '9:48', 4],     # 廊坊站(停靠站) 
+        [100, 1, '9:55', '9:55', 4],    # 胜芳站(通过站)
+        [140, 2, '10:10', '10:15', 4],  # 天津站(停靠站)
+        [170, 1, '10:32', '10:32', 4],  # 塘沽站(通过站)
+        [200, 0, '10:50', '10:50', 4],  # 滨海站(终点站)
+    ]
+    
+    train_schedule10 = [
+        [0, 0, '9:30', '9:30', 4],      # 北京南站(始发站) 
+        [40, 1, '9:40', '9:40', 4],     # 固安站(通过站)
+        [70, 2, '9:48', '9:53', 4],     # 廊坊站(停靠站) 
+        [100, 1, '10:05', '10:05', 4],  # 胜芳站(通过站)
+        [140, 2, '10:20', '10:25', 4],  # 天津站(停靠站)
+        [170, 1, '10:38', '10:38', 4],  # 塘沽站(通过站)
+        [200, 0, '11:00', '11:00', 4],  # 滨海站(终点站)
+    ]
+    
+    # 增加更多列车以测试算法性能
+    train_schedule11 = [
+        [0, 0, '9:40', '9:40', 4],      # 北京南站(始发站) 
+        [40, 1, '9:55', '9:55', 4],     # 固安站(通过站)
+        [70, 2, '10:03', '10:08', 4],   # 廊坊站(停靠站) 
+        [100, 1, '10:15', '10:15', 4],  # 胜芳站(通过站)
+        [140, 2, '10:30', '10:35', 4],  # 天津站(停靠站)
+        [170, 1, '10:52', '10:52', 4],  # 塘沽站(通过站)
+        [200, 0, '11:10', '11:10', 4],  # 滨海站(终点站)
+    ]
+    
+    train_schedule12 = [
+        [0, 0, '9:50', '9:50', 4],      # 北京南站(始发站) 
+        [40, 1, '10:00', '10:00', 4],   # 固安站(通过站)
+        [70, 2, '10:08', '10:13', 4],   # 廊坊站(停靠站) 
+        [100, 1, '10:25', '10:25', 4],  # 胜芳站(通过站)
+        [140, 2, '10:40', '10:45', 4],  # 天津站(停靠站)
+        [170, 1, '10:58', '10:58', 4],  # 塘沽站(通过站)
+        [200, 0, '11:20', '11:20', 4],  # 滨海站(终点站)
+    ]
+    
+    train_schedule13 = [
+        [0, 0, '10:00', '10:00', 4],    # 北京南站(始发站) 
+        [40, 1, '10:15', '10:15', 4],   # 固安站(通过站)
+        [70, 2, '10:23', '10:28', 4],   # 廊坊站(停靠站) 
+        [100, 1, '10:35', '10:35', 4],  # 胜芳站(通过站)
+        [140, 2, '10:50', '10:55', 4],  # 天津站(停靠站)
+        [170, 1, '11:12', '11:12', 4],  # 塘沽站(通过站)
+        [200, 0, '11:30', '11:30', 4],  # 滨海站(终点站)
+    ]
+    
+    train_schedule14 = [
+        [0, 0, '10:10', '10:10', 4],    # 北京南站(始发站) 
+        [40, 1, '10:20', '10:20', 4],   # 固安站(通过站)
+        [70, 2, '10:28', '10:33', 4],   # 廊坊站(停靠站) 
+        [100, 1, '10:45', '10:45', 4],  # 胜芳站(通过站)
+        [140, 2, '11:00', '11:05', 4],  # 天津站(停靠站)
+        [170, 1, '11:18', '11:18', 4],  # 塘沽站(通过站)
+        [200, 0, '11:40', '11:40', 4],  # 滨海站(终点站)
+    ]
+    
+    train_schedule15 = [
+        [0, 0, '10:20', '10:20', 4],    # 北京南站(始发站) 
+        [40, 1, '10:35', '10:35', 4],   # 固安站(通过站)
+        [70, 2, '10:43', '10:48', 4],   # 廊坊站(停靠站) 
+        [100, 1, '10:55', '10:55', 4],  # 胜芳站(通过站)
+        [140, 2, '11:10', '11:15', 4],  # 天津站(停靠站)
+        [170, 1, '11:32', '11:32', 4],  # 塘沽站(通过站)
+        [200, 0, '11:50', '11:50', 4],  # 滨海站(终点站)
+    ]
+    
+    # 更新站点名称字典，增加新增站点
     station_names = {
         0: "北京南",
+        40: "固安",
         70: "廊坊",
+        100: "胜芳",
         140: "天津",
+        170: "塘沽",
         200: "滨海"
     }
     
@@ -955,15 +1128,15 @@ if __name__ == "__main__":
     
     # 执行算法
     best_paths = solve_multi_train_with_lagrangian(
-        [train_schedule1, train_schedule2, train_schedule3, train_schedule4], 
+        [train_schedule1, train_schedule2, train_schedule3, train_schedule4, train_schedule5, train_schedule6, train_schedule7, train_schedule8, train_schedule9, train_schedule10], 
         # [train_schedule2, train_schedule3], 
         station_names,
-        delta_d=1,      # 500米
-        delta_t=1,      # 0.5分钟 30秒
+        delta_d=0.5,      # 500米
+        delta_t=0.5,      # 0.5分钟 30秒
         speed_levels=5, 
-        time_diff_minutes=2*60,   # 调度范围是2个小时
+        time_diff_minutes=4*60,   # 调度范围是2个小时
         total_distance=300,    # 300km的线路
-        max_distance=30,       # 25个格子
+        max_distance=10,       # 25个格子
         headway=2,             # 2个时间单位的最小间隔
         max_iterations=10,      # 最多迭代50次
         select_near_plan=True,  # 是否使用计划表完成有效点的筛选

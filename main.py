@@ -10,6 +10,7 @@ from mpl_toolkits.mplot3d import proj3d
 import math
 import heapq
 from utils import plot_sts_grid_nodes, draw_plan_on_sts_grid, finalize_plot, plot_optimal_path, export_train_schedule
+import time
 
 
 def check_end_node_in_graph(graph, stations):
@@ -399,6 +400,8 @@ def filter_nodes_near_plan(valid_nodes, stations_df, station_names, max_distance
         unique_station_positions.sort()
         
         # 为每对相邻站点计算直线方程
+        # 先计算所有直线方程和对应区段
+        line_equations = []
         for i in range(len(unique_station_positions) - 1):
             start_pos = unique_station_positions[i]
             end_pos = unique_station_positions[i+1]
@@ -424,24 +427,56 @@ def filter_nodes_near_plan(valid_nodes, stations_df, station_names, max_distance
                 
                 print(f"站点 {station_names.get(start_pos, start_pos)} 到 {station_names.get(end_pos, end_pos)} 的直线方程: t = {m:.4f} * s + {c:.4f}")
                 
-                # 绘制这段直线
-                # s_range = np.array([start_pos, end_pos])
-                # t_range = m * s_range + c
-                # ax.plot(s_range, t_range, [0, 0], 'b--', linewidth=2, 
-                #     label=f"{station_names.get(start_pos, start_pos)}-{station_names.get(end_pos, end_pos)}" if i == 0 else "_nolegend_")
+                # 保存直线方程和对应区段
+                line_equations.append({
+                    'start_pos': start_pos,
+                    'end_pos': end_pos,
+                    'slope': m,
+                    'intercept': c,
+                    'start_station': station_names.get(start_pos, start_pos),
+                    'end_station': station_names.get(end_pos, end_pos)
+                })
+        
+        # 统一计算所有节点到直线的距离
+        # 预先计算每个区段的常量部分，避免重复计算
+        eq_constants = []
+        for eq in line_equations:
+            m = eq['slope']
+            c = eq['intercept']
+            # 预计算点到直线距离公式中的分母部分
+            denominator = np.sqrt(m**2 + 1)
+            eq_constants.append({
+                'start_pos': eq['start_pos'],
+                'end_pos': eq['end_pos'],
+                'slope': m,
+                'intercept': c,
+                'denominator': denominator
+            })
+        
+        # 使用列表推导式和任何操作提高效率
+        close_nodes = set()
+        # 创建空间位置到区段的映射，避免每次都遍历所有区段
+        pos_to_segment = {}
+        
+        for node in valid_nodes:
+            i_pos, t, v = node
+            
+            # 查找缓存或计算节点所在区段
+            if i_pos not in pos_to_segment:
+                pos_to_segment[i_pos] = []
+                for idx, eq in enumerate(eq_constants):
+                    if eq['start_pos'] <= i_pos <= eq['end_pos']:
+                        pos_to_segment[i_pos].append(idx)
+            
+            # 检查节点是否在任何区段的最大距离内
+            for idx in pos_to_segment[i_pos]:
+                eq = eq_constants[idx]
+                # 使用预计算的常量计算距离
+                distance = abs(-eq['slope'] * i_pos + t - eq['intercept']) / eq['denominator']
                 
-                # 筛选离这条直线较近的节点
-                for node in valid_nodes:
-                    i_pos, t, v = node
-                    # 只考虑在当前站点区间内的节点
-                    if start_pos <= i_pos <= end_pos:
-                        # 计算节点到直线的距离 (在空间-时间平面上)
-                        # 点到直线距离公式: |ax + by + c| / sqrt(a^2 + b^2)
-                        # 这里直线方程是 t = m*s + c，转换为标准形式 -m*s + t - c = 0
-                        distance = abs(-m * i_pos + t - c) / np.sqrt(m**2 + 1)
-                        
-                        if distance <= max_distance:
-                            close_nodes.add(node)
+                if distance <= max_distance:
+                    close_nodes.add(node)
+                    break
         
         print(f"找到离计划时刻表较近的节点: {len(close_nodes)} 个")
         
@@ -449,8 +484,7 @@ def filter_nodes_near_plan(valid_nodes, stations_df, station_names, max_distance
         # for node in close_nodes:
         #     i, t, v = node
         #     ax.scatter(i, t, v, color='cyan', s=30, alpha=0.7)
-        
-        # plt.show()
+
         # 更新有效节点集合为离直线较近的节点
         return close_nodes
     else:
@@ -643,8 +677,14 @@ def create_train_schedule_sts_grid(stations_df, station_names, delta_d=5,
     # 筛选有效节点
     valid_nodes = filter_valid_nodes(all_nodes, station_positions, stations_df, train_max_speed)
     if select_near_plan:
-        print("根据计划时刻表筛选出离计划时刻表较近的节点...")  
-        valid_nodes = filter_nodes_near_plan(valid_nodes, stations_df, station_names, max_distance) # 调用函数筛选节点
+        print("使用增强型节点筛选方法...")
+        valid_nodes = enhanced_filter_valid_nodes(
+            valid_nodes,
+            stations_df,
+            station_names,
+            max_distance,
+            a_max
+        )
 
     """======================绘制有效STS网格节点============================="""  
     fig = plt.figure(figsize=(15, 12))
@@ -695,6 +735,256 @@ def create_train_schedule_sts_grid(stations_df, station_names, delta_d=5,
                         
         # 调用函数完善图形显示
         finalize_plot(ax, space_segments, time_nodes, speed_levels, delta_d, delta_t)
+
+def enhanced_filter_valid_nodes(valid_nodes, train_schedule, station_names, max_distance, a_max):
+    """
+    结合计划时刻表和能量标签的增强型节点筛选方法
+    
+    参数:
+        valid_nodes: 初始有效节点集合
+        train_schedule: 列车时刻表
+        station_names: 站点名称字典
+        max_distance: 节点到计划时刻表直线的最大距离
+        a_max: 最大加速度约束
+        
+    返回:
+        final_nodes: 筛选后的节点集合
+    """
+    print("开始增强型节点筛选...")
+    start_time = time.time()
+    
+    # 第一阶段：使用计划时刻表进行粗筛选
+    print("第一阶段：基于计划时刻表的空间筛选...")
+    # 提取站点位置和时间信息
+    station_positions = []
+    station_times = []
+    
+    for station in train_schedule:
+        position = station[0]
+        arrive_time = station[2]
+        depart_time = station[3]
+        
+        station_positions.append(position)
+        station_times.append(arrive_time)
+        
+        if arrive_time != depart_time:
+            station_positions.append(position)
+            station_times.append(depart_time)
+    
+    # 获取唯一的站点位置并排序
+    unique_station_positions = sorted(list(set(station_positions)))
+    
+    # 计算各区段的直线方程
+    line_equations = []
+    for i in range(len(unique_station_positions) - 1):
+        start_pos = unique_station_positions[i]
+        end_pos = unique_station_positions[i+1]
+        
+        # 找出这两个站点对应的时间点
+        start_times = [t for j, t in enumerate(station_times) if station_positions[j] == start_pos]
+        end_times = [t for j, t in enumerate(station_times) if station_positions[j] == end_pos]
+        
+        start_time = min(start_times)
+        end_time = max(end_times)
+        
+        if end_pos > start_pos:
+            m = (end_time - start_time) / (end_pos - start_pos)
+            c = start_time - m * start_pos
+            
+            print(f"区段 {station_names.get(start_pos, start_pos)} -> {station_names.get(end_pos, end_pos)}: t = {m:.4f}s + {c:.4f}")
+            
+            line_equations.append({
+                'start_pos': start_pos,
+                'end_pos': end_pos,
+                'slope': m,
+                'intercept': c,
+                'denominator': np.sqrt(m**2 + 1)  # 预计算距离公式分母
+            })
+    
+    # 使用向量化操作进行空间筛选
+    space_filtered_nodes = set()
+    pos_to_segment = {}
+    
+    # 批量处理节点以提高效率
+    batch_size = 1000
+    nodes_list = list(valid_nodes)
+    
+    for i in range(0, len(nodes_list), batch_size):
+        batch_nodes = nodes_list[i:i+batch_size]
+        for node in batch_nodes:
+            i_pos, t, v = node
+            
+            # 查找或计算节点所在区段
+            if i_pos not in pos_to_segment:
+                pos_to_segment[i_pos] = [
+                    idx for idx, eq in enumerate(line_equations)
+                    if eq['start_pos'] <= i_pos <= eq['end_pos']
+                ]
+            
+            # 检查节点到任一区段直线的距离
+            for idx in pos_to_segment[i_pos]:
+                eq = line_equations[idx]
+                distance = abs(-eq['slope'] * i_pos + t - eq['intercept']) / eq['denominator']
+                
+                if distance <= max_distance:
+                    space_filtered_nodes.add(node)
+                    break
+    
+    print(f"空间筛选后剩余节点数: {len(space_filtered_nodes)}")
+    
+    # 第二阶段：使用能量标签进行精确筛选
+    print("第二阶段：基于能量标签的可达性筛选...")
+    
+    # 初始化能量标签
+    pi_forward = {node: float('inf') for node in space_filtered_nodes}
+    pi_backward = {node: float('inf') for node in space_filtered_nodes}
+    
+    # 设置起终点能量标签
+    start_node = (train_schedule[0][0], train_schedule[0][2], 0)
+    end_node = (train_schedule[-1][0], train_schedule[-1][2], 0)
+    pi_forward[start_node] = 0
+    pi_backward[end_node] = 0
+    
+    # 使用numpy进行向量化计算能量消耗
+    def calculate_energy_cost_vectorized(nodes1, nodes2):
+        """向量化计算能量消耗"""
+        i1, t1, v1 = zip(*nodes1)
+        i2, t2, v2 = zip(*nodes2)
+        
+        i1, t1, v1 = np.array(i1), np.array(t1), np.array(v1)
+        i2, t2, v2 = np.array(i2), np.array(t2), np.array(v2)
+        
+        delta_v = v2 - v1
+        delta_s = i2 - i1
+        delta_t = t2 - t1
+        
+        # 避免除以零
+        delta_t = np.maximum(delta_t, 1e-6)
+        
+        return np.abs(delta_v) / delta_t + np.abs(delta_s) / delta_t
+    
+    # 更新前向标签
+    def update_forward_labels():
+        updated = False
+        nodes = list(space_filtered_nodes)
+        
+        for i in range(0, len(nodes), batch_size):
+            batch_nodes = nodes[i:i+batch_size]
+            for node1 in batch_nodes:
+                i1, t1, v1 = node1
+                # 筛选可能的下一个节点
+                valid_next_nodes = [
+                    node2 for node2 in nodes 
+                    if node2[1] > t1 and  # 时间必须递增
+                    abs((node2[2] - v1) / (node2[1] - t1)) <= a_max  # 加速度约束
+                ]
+                
+                if valid_next_nodes:
+                    energy_costs = calculate_energy_cost_vectorized(
+                        [node1] * len(valid_next_nodes),
+                        valid_next_nodes
+                    )
+                    
+                    for node2, cost in zip(valid_next_nodes, energy_costs):
+                        if pi_forward[node2] > pi_forward[node1] + cost:
+                            pi_forward[node2] = pi_forward[node1] + cost
+                            updated = True
+        
+        return updated
+    
+    # 更新后向标签
+    def update_backward_labels():
+        updated = False
+        nodes = list(space_filtered_nodes)
+        
+        for i in range(0, len(nodes), batch_size):
+            batch_nodes = nodes[i:i+batch_size]
+            for node2 in batch_nodes:
+                i2, t2, v2 = node2
+                # 筛选可能的前一个节点
+                valid_prev_nodes = [
+                    node1 for node1 in nodes
+                    if node1[1] < t2 and  # 时间必须递增
+                    abs((v2 - node1[2]) / (t2 - node1[1])) <= a_max  # 加速度约束
+                ]
+                
+                if valid_prev_nodes:
+                    energy_costs = calculate_energy_cost_vectorized(
+                        valid_prev_nodes,
+                        [node2] * len(valid_prev_nodes)
+                    )
+                    
+                    for node1, cost in zip(valid_prev_nodes, energy_costs):
+                        if pi_backward[node1] > pi_backward[node2] + cost:
+                            pi_backward[node1] = pi_backward[node2] + cost
+                            updated = True
+        
+        return updated
+    
+    # 执行标签更新
+    print("更新能量标签...")
+    max_iterations = 10  # 设置最大迭代次数
+    for iteration in range(max_iterations):
+        forward_updated = update_forward_labels()
+        backward_updated = update_backward_labels()
+        
+        if not (forward_updated or backward_updated):
+            print(f"能量标签在第 {iteration + 1} 次迭代后收敛")
+            break
+    
+    # 根据能量标签筛选最终节点
+    print("根据能量标签筛选最终节点...")
+    theta = 1000  # 能量阈值，可根据实际情况调整
+    final_nodes = {
+        node for node in space_filtered_nodes
+        if pi_forward[node] + pi_backward[node] < theta
+    }
+    
+    end_time = time.time()
+    print(f"节点筛选完成，耗时: {end_time - start_time:.2f}秒")
+    print(f"初始节点数: {len(valid_nodes)}")
+    print(f"空间筛选后节点数: {len(space_filtered_nodes)}")
+    print(f"最终节点数: {len(final_nodes)}")
+    
+    return final_nodes
+
+def calculate_energy_cost(i1, t1, v1, i2, t2, v2):
+    """
+    计算两个节点之间的能量消耗
+    可以根据实际物理模型来实现
+    """
+    # 简化的能量消耗计算示例
+    delta_v = v2 - v1
+    delta_s = i2 - i1
+    delta_t = t2 - t1
+    
+    # 考虑加速和距离的能量消耗
+    energy = abs(delta_v) / delta_t + abs(delta_s) / delta_t
+    return energy
+
+def is_valid_arc(i1, t1, v1, i2, t2, v2, a_max):
+    """
+    检查两个节点之间是否可以构成有效弧
+    """
+    if t2 <= t1:  # 时间必须递增
+        return False
+        
+    delta_t = t2 - t1
+    delta_v = v2 - v1
+    delta_s = i2 - i1
+    
+    # 检查加速度约束
+    if abs(delta_v / delta_t) > a_max:
+        return False
+        
+    # 检查平均速度与位移的关系
+    avg_speed = (v1 + v2) / 2
+    expected_s = avg_speed * delta_t
+    
+    if abs(delta_s - expected_s) > 0.5:  # 允许一定误差
+        return False
+        
+    return True
 
 if __name__ == "__main__":
     train_schedule = [
