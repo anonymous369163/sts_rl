@@ -107,23 +107,26 @@ def verify_multiplier_impact(new_multipliers, all_selected_arcs, headway):
 def find_optimal_path_with_lagrangian(valid_nodes, graph, start_node, end_node, 
                                      multipliers, train_idx, headway, ax=None, drawn_arcs=set()):
     """
-    使用带有拉格朗日乘子的Dijkstra算法寻找最优路径
+    使用带有拉格朗日乘子的Dijkstra算法寻找最优路径，支持新的节点结构和股道约束
     
     参数:
         valid_nodes: 有效节点集合
         graph: 图的邻接表表示
-        start_node: 起点节点 (位置, 时间, 速度)
-        end_node: 终点节点 (位置, 时间, 速度)
-        multipliers: 拉格朗日乘子字典，键为(i,j,τ)，τ可以是起点时间t或终点时间s
-        incompatible_arcs_dict: 不兼容弧集合字典，键为(i,j,τ)，值为与该时空位置冲突的弧集合
+        start_node: 起点节点 (位置, 时间, 速度, 是否进站, 股道)
+        end_node: 终点节点 (位置, 时间, 速度, 是否进站, 股道)
+        multipliers: 拉格朗日乘子字典，键为(i,j,τ,track_id)
         train_idx: 当前列车的索引
+        headway: 最小间隔时间
         ax: 可选的绘图对象，用于可视化
+        drawn_arcs: 已绘制的弧集合
     
     返回:
         path: 最优路径列表
         dist: 距离字典
         prev: 前驱节点字典
         selected_arcs: 列车所选择的弧
+        ax: 更新后的绘图对象
+        drawn_arcs: 更新后的已绘制弧集合
     """
     all_graph_nodes = valid_nodes
     selected_arcs = []  # 记录该列车选择的所有弧
@@ -163,27 +166,73 @@ def find_optimal_path_with_lagrangian(valid_nodes, graph, start_node, end_node,
             for v, base_cost in graph[u]:
                 # 检查邻居节点是否有效
                 if v in dist:
-                    # 构建当前弧 (i,j,t,s,u,v)
-                    i, t, v_speed = u
-                    j, s, u_speed = v
-                    arc = (i, j, t, s, v_speed, u_speed)
+                    # 构建当前弧，支持新的节点结构
+                    if len(u) >= 5 and len(v) >= 5:  # 新结构
+                        i, t, v_speed, entry_flag_i, track_i = u
+                        j, s, u_speed, entry_flag_j, track_j = v
+                        
+                        # 是否为车站内部弧
+                        is_station_arc = (i == j) and (entry_flag_i == 0) and (entry_flag_j == 1) and (track_j is not None)
+                        
+                        # 构建增强的弧表示
+                        arc = (i, j, t, s, v_speed, u_speed, entry_flag_i, entry_flag_j, track_j if is_station_arc else None)
+                    else:  # 兼容原有结构
+                        i, t, v_speed = u[:3]
+                        j, s, u_speed = v[:3]
+                        arc = (i, j, t, s, v_speed, u_speed)
                     
                     # 计算拉格朗日惩罚项
                     penalty = 0.0
                     
-                    # 检查起点时间及其headway范围内的不兼容集合
-                    i_pos, j_pos = min(i, j), max(i, j)
+                    # 检查是否为车站内部弧，如果是则使用股道约束
+                    if len(u) >= 5 and len(v) >= 5 and i == j and entry_flag_i == 0 and entry_flag_j == 1 and track_j is not None:
+                        # 车站内部弧，使用股道信息
+                        i_pos, j_pos = min(i, j), max(i, j)
+                        
+                        # 考虑当前弧的起点和终点时间及其附近的时间点
+                        for time_offset in range(-headway, headway + 1):
+                            # 起点附近的时间点
+                            start_time = t + time_offset
+                            start_key = (i_pos, j_pos, start_time, track_j)
+                            
+                            # 终点附近的时间点
+                            end_time = s + time_offset
+                            end_key = (i_pos, j_pos, end_time, track_j)
+                            
+                            # 检查并添加惩罚
+                            if start_key in multipliers:
+                                penalty += multipliers[start_key]
+                            if end_key in multipliers:
+                                penalty += multipliers[end_key]
+                    else:
+                        # 非车站内部弧，使用原有约束
+                        i_pos, j_pos = min(i, j), max(i, j)
+                        
+                        # 考虑当前弧的起点和终点时间及其附近的时间点
+                        for time_offset in range(-headway, headway + 1):
+                            # 起点附近的时间点
+                            start_time = t + time_offset
+                            start_key = (i_pos, j_pos, start_time, None)
+                            
+                            # 终点附近的时间点
+                            end_time = s + time_offset
+                            end_key = (i_pos, j_pos, end_time, None)
+                            
+                            # 检查并添加惩罚
+                            if start_key in multipliers:
+                                penalty += multipliers[start_key]
+                            if end_key in multipliers:
+                                penalty += multipliers[end_key]
+                            
+                            # 检查旧格式的键
+                            old_start_key = (i_pos, j_pos, start_time)
+                            old_end_key = (i_pos, j_pos, end_time)
+                            
+                            if old_start_key in multipliers:
+                                penalty += multipliers[old_start_key]
+                            if old_end_key in multipliers:
+                                penalty += multipliers[old_end_key]
                     
-                    # 只根据当前弧的起点和终点时间添加惩罚
-                    start_key = (i_pos, j_pos, t)
-                    end_key = (i_pos, j_pos, s)
-                    
-                    # 检查并添加惩罚
-                    if start_key in multipliers:
-                        penalty += multipliers[start_key]
-                    if end_key in multipliers:
-                        penalty += multipliers[end_key]
-
                     # 记录加入惩罚的弧
                     if penalty > 0:
                         drawn_arcs.add(arc)
@@ -209,13 +258,13 @@ def find_optimal_path_with_lagrangian(valid_nodes, graph, start_node, end_node,
             reachable_nodes_labeled = False
             for node, distance in dist.items():
                 if distance != math.inf:
-                    if isinstance(node, tuple) and len(node) == 3:
-                        i_node, t_node, v_node = node
-                        label_to_add = ""
-                        if not reachable_nodes_labeled:
-                            label_to_add = f'列车{train_idx}可达节点'
-                            reachable_nodes_labeled = True
-                        ax.scatter(i_node, t_node, v_node, color=f'C{train_idx}', s=60, marker='p', alpha=0.8, label=label_to_add)
+                    node_pos, node_time = node[0], node[1]  # 提取位置和时间，适用于新旧节点结构
+                    node_speed = node[2]  # 提取速度
+                    label_to_add = ""
+                    if not reachable_nodes_labeled:
+                        label_to_add = f'列车{train_idx}可达节点'
+                        reachable_nodes_labeled = True
+                    ax.scatter(node_pos, node_time, node_speed, color=f'C{train_idx}', s=60, marker='p', alpha=0.8, label=label_to_add)
             
             if not reachable_nodes_labeled and start_node in dist and dist[start_node] == 0:
                 print(f"列车 {train_idx}：除了起点外，没有其他可达节点。")
@@ -230,12 +279,24 @@ def find_optimal_path_with_lagrangian(valid_nodes, graph, start_node, end_node,
     current = end_node
     
     while current and prev[current]:
-        # 记录弧 (i,j,t,s,u,v)
+        # 记录弧，支持新的节点结构
         next_node = current
         prev_node = prev[current]
-        i, t, v_speed = prev_node
-        j, s, u_speed = next_node
-        arc = (i, j, t, s, v_speed, u_speed)
+        
+        if len(prev_node) >= 5 and len(next_node) >= 5:  # 新结构
+            i, t, v_speed, entry_flag_i, track_i = prev_node
+            j, s, u_speed, entry_flag_j, track_j = next_node
+            
+            # 是否为车站内部弧
+            is_station_arc = (i == j) and (entry_flag_i == 0) and (entry_flag_j == 1) and (track_j is not None)
+            
+            # 构建增强的弧表示
+            arc = (i, j, t, s, v_speed, u_speed, entry_flag_i, entry_flag_j, track_j if is_station_arc else None)
+        else:  # 兼容原有结构
+            i, t, v_speed = prev_node[:3]
+            j, s, u_speed = next_node[:3]
+            arc = (i, j, t, s, v_speed, u_speed)
+        
         selected_arcs.append(arc)
         
         path.append(current)
@@ -249,7 +310,6 @@ def find_optimal_path_with_lagrangian(valid_nodes, graph, start_node, end_node,
     
     return path, dist, prev, selected_arcs, ax, drawn_arcs
 
-from main import enhanced_filter_valid_nodes
 # 定义处理单个列车的函数
 def process_single_train(train_idx, train_schedule, all_nodes, train_max_speed, select_near_plan, station_names, max_distance, a_max):
     # 筛选单个列车的有效节点
@@ -267,6 +327,227 @@ def process_single_train(train_idx, train_schedule, all_nodes, train_max_speed, 
     
     return train_idx, valid_nodes, graph, len_valid_arcs
 
+def filter_valid_nodes(all_nodes, station_positions, train_schedule, train_max_speed):
+    """
+    筛选有效节点，适配新的节点结构
+    
+    参数:
+        all_nodes: 所有节点集合
+        station_positions: 站点位置列表
+        train_schedule: 列车时刻表
+        train_max_speed: 列车最大速度
+        
+    返回:
+        valid_nodes: 有效节点集合
+    """
+    valid_nodes = set()
+    
+    start_pos = train_schedule[0][0]
+    end_pos = train_schedule[-1][0]
+    start_time = train_schedule[0][2]
+    end_time = train_schedule[-1][2]
+    
+    # 获取所有节点的位置范围和时间范围
+    all_positions = set()
+    all_times = set()
+    all_speeds = set()
+    for node in all_nodes:
+        if len(node) >= 5:  # 适配新的节点结构
+            i, t, v, entry_flag, track = node
+            all_positions.add(i)
+            all_times.add(t)
+            all_speeds.add(v)
+    
+    min_pos, max_pos = min(all_positions), max(all_positions)
+    min_time, max_time = min(all_times), max(all_times)
+    
+    # 筛选节点
+    for node in all_nodes:
+        if len(node) >= 5:  # 确保节点是新格式
+            i, t, v, entry_flag, track = node
+            
+            # 检查位置是否在列车运行范围内
+            if min(start_pos, end_pos) <= i <= max(start_pos, end_pos):
+                # 检查时间是否在列车运行时间范围内
+                if start_time <= t <= end_time:
+                    # 检查速度是否不超过最大速度
+                    if v <= train_max_speed:
+                        valid_nodes.add(node)
+    
+    print(f"筛选出 {len(valid_nodes)} 个有效节点")
+    return valid_nodes
+
+def filter_nodes_near_plan(valid_nodes, train_schedule, station_names, max_distance):
+    """
+    根据计划时刻表筛选节点，适配新的节点结构
+    
+    参数:
+        valid_nodes: 有效节点集合
+        train_schedule: 列车时刻表
+        station_names: 车站名称字典
+        max_distance: 最大距离
+        
+    返回:
+        filtered_nodes: 筛选后的节点集合
+    """
+    filtered_nodes = set()
+    
+    # 创建计划点字典，键为位置，值为时间
+    plan_points = {}
+    for station in train_schedule:
+        pos, _, time = station[:3]
+        plan_points[pos] = time
+    
+    # 处理车站点和非车站点
+    for node in valid_nodes:
+        if len(node) >= 5:  # 适配新的节点结构
+            i, t, v, entry_flag, track = node
+            
+            # 检查节点位置是否在计划点中
+            if i in plan_points:
+                # 对于车站点，计算与计划时间的距离
+                time_diff = abs(t - plan_points[i])
+                if time_diff <= max_distance:
+                    filtered_nodes.add(node)
+            else:
+                # 对于非车站点，找最近的左右计划点进行插值
+                left_pos = None
+                right_pos = None
+                
+                for pos in sorted(plan_points.keys()):
+                    if pos < i:
+                        left_pos = pos
+                    elif pos > i:
+                        right_pos = pos
+                        break
+                
+                # 线性插值计算预期时间
+                if left_pos is not None and right_pos is not None:
+                    left_time = plan_points[left_pos]
+                    right_time = plan_points[right_pos]
+                    
+                    # 插值计算预期时间
+                    expected_time = left_time + (right_time - left_time) * (i - left_pos) / (right_pos - left_pos)
+                    
+                    # 计算与预期时间的距离
+                    time_diff = abs(t - expected_time)
+                    if time_diff <= max_distance:
+                        filtered_nodes.add(node)
+    
+    print(f"根据计划时刻表筛选出 {len(filtered_nodes)} 个节点")
+    return filtered_nodes
+
+def create_valid_arcs(valid_nodes, train_schedule, a_max):
+    """
+    创建有效弧，适配新的节点结构并考虑车站内股道约束
+    
+    参数:
+        valid_nodes: 有效节点集合
+        train_schedule: 列车时刻表
+        a_max: 最大加速度约束
+        
+    返回:
+        graph: 图的邻接表表示
+        len_valid_arcs: 有效弧数量
+    """
+    graph = {}
+    valid_arcs_count = 0
+    
+    # 获取站点位置
+    station_positions = [int(round(station[0])) for station in train_schedule]
+    
+    # 将节点按照位置和时间分组，方便后续查找
+    nodes_by_pos_time = {}
+    for node in valid_nodes:
+        i, t, v, entry_flag, track = node
+        if (i, t) not in nodes_by_pos_time:
+            nodes_by_pos_time[(i, t)] = []
+        nodes_by_pos_time[(i, t)].append(node)
+    
+    # 遍历所有节点创建弧
+    for from_node in valid_nodes:
+        i, t, v, entry_flag, track_from = from_node
+        
+        # 初始化图结构
+        if from_node not in graph:
+            graph[from_node] = []
+        
+        # 处理不同类型的节点
+        if i in station_positions:
+            # 车站节点
+            if entry_flag == 0:  # 进站节点
+                # 连接到同一车站的出站节点
+                for to_node in valid_nodes:
+                    j, s, u, to_entry_flag, track_to = to_node
+                    
+                    # 只连接同一车站的进站节点到出站节点
+                    if j == i and to_entry_flag == 1 and s > t:
+                        # 在车站内部，从进站节点到出站节点需要考虑股道
+                        # 计算停站时间成本
+                        stopping_time = s - t
+                        min_stopping_time = 2  # 最小停站时间单位
+                        
+                        # 确保停站时间满足最小要求
+                        if stopping_time >= min_stopping_time:
+                            # 创建站内弧，成本基于停站时间
+                            cost = stopping_time * 0.5  # 停站时间乘以权重因子
+                            graph[from_node].append((to_node, cost))
+                            valid_arcs_count += 1
+            
+            elif entry_flag == 1:  # 出站节点
+                # 连接到其他地点的节点(非车站或其他车站的进站节点)
+                for to_node in valid_nodes:
+                    j, s, u, to_entry_flag, track_to = to_node
+                    
+                    # 只连接到非本站的节点或其他车站的进站节点
+                    if j != i and s > t:
+                        # 如果目标是另一个车站，确保连接到进站节点
+                        if j in station_positions:
+                            if to_entry_flag != 0:  # 不是进站节点，跳过
+                                continue
+                        
+                        # 计算弧的成本
+                        distance = abs(j - i)
+                        time_diff = s - t
+                        
+                        # 检查速度变化是否符合加速度约束
+                        if time_diff > 0:
+                            speed_change = abs(u - v)
+                            acceleration = speed_change / time_diff
+                            
+                            if acceleration <= a_max:
+                                # 创建弧，成本基于距离和时间
+                                cost = distance + time_diff * 0.1
+                                graph[from_node].append((to_node, cost))
+                                valid_arcs_count += 1
+        
+        else:
+            # 非车站节点
+            for to_node in valid_nodes:
+                j, s, u, to_entry_flag, track_to = to_node
+                
+                # 只连接到时间更晚的节点
+                if s > t:
+                    # 如果目标是车站，确保连接到进站节点
+                    if j in station_positions and to_entry_flag != 0:
+                        continue
+                    
+                    # 计算弧的成本
+                    distance = abs(j - i)
+                    time_diff = s - t
+                    
+                    # 检查速度变化是否符合加速度约束
+                    if time_diff > 0:
+                        speed_change = abs(u - v)
+                        acceleration = speed_change / time_diff
+                        
+                        if acceleration <= a_max:
+                            # 创建弧，成本基于距离和时间
+                            cost = distance + time_diff * 0.1
+                            graph[from_node].append((to_node, cost))
+                            valid_arcs_count += 1
+    
+    return graph, valid_arcs_count
 
 def identify_incompatible_arcs(graph, headway):
     """
@@ -335,80 +616,370 @@ def identify_incompatible_arcs(graph, headway):
     return incompatible_arcs_dict
 
 
-def update_multipliers(multipliers, train_paths, step_size, headway):
+def detect_train_overtaking(train_paths):
     """
-    使用次梯度法更新拉格朗日乘子
+    检测列车之间的越行情况
     
     参数:
-        multipliers: 当前拉格朗日乘子字典，键为(i,j,τ)
         train_paths: 所有列车的路径弧列表
-        incompatible_arcs_dict: 不兼容弧集合字典，键为(i,j,τ)，值为与该时空位置冲突的弧集合
+        
+    返回:
+        overtaking_events: 越行事件列表
+    """
+    # 用于检测列车越行的数据结构
+    train_positions = {}  # 记录每个列车在每个时间点的位置
+    overtaking_events = []  # 记录越行事件
+    
+    # 首先收集每个列车在每个时间点的位置信息
+    for train_idx, train_arcs in enumerate(train_paths):
+        for arc in train_arcs:
+            i, j, t, s, _, _ = arc
+            # 确保i是较小的位置，j是较大的位置
+            i_pos, j_pos = min(i, j), max(i, j)
+            
+            # 记录列车在起点时间t的位置i
+            if t not in train_positions:
+                train_positions[t] = {}
+            train_positions[t][train_idx] = i_pos
+            
+            # 记录列车在终点时间s的位置j
+            if s not in train_positions:
+                train_positions[s] = {}
+            train_positions[s][train_idx] = j_pos
+    
+    # 按时间顺序排序
+    sorted_times = sorted(train_positions.keys())
+    
+    # 检测越行情况
+    if len(train_paths) >= 2:  # 至少有两列车才可能发生越行
+        # 记录每列车的前进方向（1表示向前，-1表示向后）
+        train_directions = {}
+        
+        # 确定每列车的运行方向
+        for train_idx, train_arcs in enumerate(train_paths):
+            if train_arcs:
+                first_arc = train_arcs[0]
+                last_arc = train_arcs[-1]
+                start_pos = min(first_arc[0], first_arc[1])
+                end_pos = min(last_arc[0], last_arc[1])
+                train_directions[train_idx] = 1 if end_pos > start_pos else -1
+        
+        # 检查相邻时间点之间的位置变化
+        for t_idx in range(1, len(sorted_times)):
+            prev_time = sorted_times[t_idx-1]
+            curr_time = sorted_times[t_idx]
+            
+            # 获取在这两个时间点都有记录的列车
+            common_trains = set(train_positions[prev_time].keys()) & set(train_positions[curr_time].keys())
+            
+            # 如果至少有两列车在这两个时间点都有记录
+            if len(common_trains) >= 2:
+                train_list = list(common_trains)
+                
+                # 比较每对列车
+                for i in range(len(train_list)):
+                    for j in range(i+1, len(train_list)):
+                        train_a = train_list[i]
+                        train_b = train_list[j]
+                        
+                        # 确保两列车运行方向相同
+                        if train_a in train_directions and train_b in train_directions:
+                            if train_directions[train_a] == train_directions[train_b]:
+                                # 获取两列车在前后时间点的位置
+                                a_prev_pos = train_positions[prev_time][train_a]
+                                a_curr_pos = train_positions[curr_time][train_a]
+                                b_prev_pos = train_positions[prev_time][train_b]
+                                b_curr_pos = train_positions[curr_time][train_b]
+                                
+                                # 检测越行：如果列车A在前一时刻在列车B前面，但在当前时刻在列车B后面
+                                if (a_prev_pos < b_prev_pos and a_curr_pos > b_curr_pos) or \
+                                   (a_prev_pos > b_prev_pos and a_curr_pos < b_curr_pos):
+                                    # 记录越行事件
+                                    overtaking_event = {
+                                        "time_interval": (prev_time, curr_time),
+                                        "space_interval": (min(a_prev_pos, a_curr_pos, b_prev_pos, b_curr_pos),
+                                                          max(a_prev_pos, a_curr_pos, b_prev_pos, b_curr_pos)),
+                                        "trains": (train_a, train_b),
+                                        "location": (a_prev_pos, a_curr_pos, b_prev_pos, b_curr_pos)
+                                    }
+                                    overtaking_events.append(overtaking_event)
+    return overtaking_events
+
+
+def update_multipliers(multipliers, train_paths, step_size, headway, debug_mode=False, ax=None):
+    """
+    使用次梯度法更新拉格朗日乘子，考虑股道维度
+    
+    参数:
+        multipliers: 当前拉格朗日乘子字典，键为(i,j,τ,track_id)
+        train_paths: 所有列车的路径弧列表
         step_size: 次梯度更新步长
+        headway: 最小间隔时间
+        debug_mode: 是否开启调试模式
+        ax: 绘图对象
         
     返回:
         new_multipliers: 更新后的拉格朗日乘子
         total_violations: 约束违反总数
+        conflict_zones: 冲突区域
     """
     # new_multipliers = copy.deepcopy(multipliers)
     new_multipliers = multipliers
     total_violations = 0
     
-    # 创建每个时空位置(i,j,τ)上的列车使用情况
-    space_time_usage = {}
+    # 创建每个时空位置(i,j,τ,track_id)上的列车使用情况
+    space_time_usage = {} 
+
+    if debug_mode:
+        # 检测列车越行情况
+        overtaking_events = detect_train_overtaking(train_paths)
+        
+        # 输出越行检测结果
+        if overtaking_events:
+            print("\n检测到以下越行情况:")
+            for idx, event in enumerate(overtaking_events):
+                print(f"越行事件 {idx+1}:")
+                print(f"  时间区间: {event['time_interval'][0]} - {event['time_interval'][1]}")
+                print(f"  空间区间: {event['space_interval'][0]} - {event['space_interval'][1]}")
+                print(f"  涉及列车: {event['trains'][0]} 和 {event['trains'][1]}")
+        else:
+            print("\n未检测到列车越行情况")
     
+    # 检测越行位置的时间间隔是否满足headway约束
+    if debug_mode and 'overtaking_events' in locals() and overtaking_events:
+        print("\n检查越行位置的时间间隔约束:")
+        for idx, event in enumerate(overtaking_events):
+            train_a, train_b = event['trains']
+            a_prev_pos, a_curr_pos, b_prev_pos, b_curr_pos = event['location']
+            prev_time, curr_time = event['time_interval']
+            
+            # 查找两列车在越行位置的具体时间
+            train_a_times = {}
+            train_b_times = {}
+            
+            # 收集列车A的时间信息
+            for arc in train_paths[train_a]:
+                i, j, t, s, _, _, entry_flag_i, entry_flag_j, track_id = arc if len(arc) >= 9 else (*arc, None, None, None)
+                if i == a_prev_pos and j == a_curr_pos:
+                    train_a_times[i] = t
+                    train_a_times[j] = s
+                elif i == a_curr_pos and j == a_prev_pos:
+                    train_a_times[i] = t
+                    train_a_times[j] = s
+            
+            # 收集列车B的时间信息
+            for arc in train_paths[train_b]:
+                i, j, t, s, _, _, entry_flag_i, entry_flag_j, track_id = arc if len(arc) >= 9 else (*arc, None, None, None)
+                if i == b_prev_pos and j == b_curr_pos:
+                    train_b_times[i] = t
+                    train_b_times[j] = s
+                elif i == b_curr_pos and j == b_prev_pos:
+                    train_b_times[i] = t
+                    train_b_times[j] = s
+            
+            # 检查越行位置的时间间隔
+            headway_violations = []
+            for pos in set([a_prev_pos, a_curr_pos, b_prev_pos, b_curr_pos]):
+                if pos in train_a_times and pos in train_b_times:
+                    time_diff = abs(train_a_times[pos] - train_b_times[pos])
+                    if time_diff < headway:
+                        headway_violations.append((pos, time_diff))
+            
+            # 输出结果
+            print(f"越行事件 {idx+1} (列车 {train_a} 和 {train_b}):")
+            if headway_violations:
+                print(f"  发现时间间隔违反 (要求间隔>={headway}):")
+                for pos, time_diff in headway_violations:
+                    print(f"    位置 {pos}: 时间间隔为 {time_diff}")
+            else:
+                print(f"所有位置的时间间隔均满足headway>={headway}的约束")
+    
+    # 在三维空间中标记越行位置的时间信息
+    if debug_mode and 'overtaking_events' in locals() and overtaking_events and ax is not None:
+        print("\n在三维空间中标记越行位置的时间信息...")
+        for idx, event in enumerate(overtaking_events):
+            train_a, train_b = event['trains']
+            a_prev_pos, a_curr_pos, b_prev_pos, b_curr_pos = event['location']
+            prev_time, curr_time = event['time_interval']
+            
+            # 收集列车A的时间和速度信息
+            train_a_info = {}  # 格式: {位置: (时间, 速度)}
+            train_b_info = {}
+            
+            # 收集列车A的信息
+            for arc in train_paths[train_a]:
+                i, j, t, s, v_speed, u_speed, entry_flag_i, entry_flag_j, track_id = arc if len(arc) >= 9 else (*arc, None, None, None)
+                if i == a_prev_pos and j == a_curr_pos:
+                    train_a_info[i] = (t, v_speed)
+                    train_a_info[j] = (s, u_speed)
+                elif i == a_curr_pos and j == a_prev_pos:
+                    train_a_info[i] = (t, v_speed)
+                    train_a_info[j] = (s, u_speed)
+            
+            # 收集列车B的信息
+            for arc in train_paths[train_b]:
+                i, j, t, s, v_speed, u_speed, entry_flag_i, entry_flag_j, track_id = arc if len(arc) >= 9 else (*arc, None, None, None)
+                if i == b_prev_pos and j == b_curr_pos:
+                    train_b_info[i] = (t, v_speed)
+                    train_b_info[j] = (s, u_speed)
+                elif i == b_curr_pos and j == b_prev_pos:
+                    train_b_info[i] = (t, v_speed)
+                    train_b_info[j] = (s, u_speed)
+            
+            # 在三维空间中标记这些特殊点
+            special_positions = set([a_prev_pos, a_curr_pos, b_prev_pos, b_curr_pos])
+            for pos in special_positions:
+                # 标记列车A的点
+                if pos in train_a_info:
+                    time_a, speed_a = train_a_info[pos]
+                    ax.scatter(pos, time_a, speed_a, 
+                              color=f'C{train_a}', s=200, marker='D', 
+                              edgecolors='black', linewidth=2, 
+                              label=f'列车{train_a}越行点' if idx == 0 and pos == a_prev_pos else "")
+                    ax.text(pos, time_a, speed_a + 0.5, 
+                           f'列车{train_a}\n位置{pos}\n时间{time_a}', 
+                           color=f'C{train_a}', fontsize=10, 
+                           bbox=dict(facecolor='white', alpha=0.7))
+                
+                # 标记列车B的点
+                if pos in train_b_info:
+                    time_b, speed_b = train_b_info[pos]
+                    ax.scatter(pos, time_b, speed_b, 
+                              color=f'C{train_b}', s=200, marker='D', 
+                              edgecolors='black', linewidth=2, 
+                              label=f'列车{train_b}越行点' if idx == 0 and pos == b_prev_pos else "")
+                    ax.text(pos, time_b, speed_b + 0.5, 
+                           f'列车{train_b}\n位置{pos}\n时间{time_b}', 
+                           color=f'C{train_b}', fontsize=10, 
+                           bbox=dict(facecolor='white', alpha=0.7))
+                
+                # 如果两列车在同一位置有时间记录，则连接它们以显示时间差
+                if pos in train_a_info and pos in train_b_info:
+                    time_a, speed_a = train_a_info[pos]
+                    time_b, speed_b = train_b_info[pos]
+                    time_diff = abs(time_a - time_b)
+                    
+                    # 用虚线连接两个点，显示时间差
+                    ax.plot([pos, pos], [time_a, time_b], [speed_a, speed_b], 
+                           color='red' if time_diff < headway else 'green', 
+                           linestyle='--', linewidth=2, alpha=0.8)
+                    
+                    # 在连线中间标记时间差
+                    mid_time = (time_a + time_b) / 2
+                    mid_speed = (speed_a + speed_b) / 2
+                    ax.text(pos, mid_time, mid_speed, 
+                           f'Δt={time_diff}', 
+                           color='red' if time_diff < headway else 'green', 
+                           fontsize=12, fontweight='bold',
+                           bbox=dict(facecolor='white', alpha=0.9))
+            
+            print(f"已标记越行事件 {idx+1} 的特殊点 (列车 {train_a} 和 {train_b})")
+
+
     # 收集所有列车所使用的弧
     for train_idx, train_arcs in enumerate(train_paths):
         for arc in train_arcs:
-            i, j, t, s, _, _ = arc
+            # 检查弧的格式，支持新旧格式
+            if len(arc) >= 9:  # 新格式：包含进出站标志和股道信息
+                i, j, t, s, v_speed, u_speed, entry_flag_i, entry_flag_j, track_id = arc
+            else:  # 旧格式：不包含进出站标志和股道信息
+                i, j, t, s, v_speed, u_speed = arc
+                entry_flag_i = entry_flag_j = track_id = None
+            
             i_pos, j_pos = min(i, j), max(i, j)
             
-            # 记录起点时间位置
-            start_key = (i_pos, j_pos, t)
-            if start_key not in space_time_usage:
-                space_time_usage[start_key] = []
-            space_time_usage[start_key].append(train_idx)
+            # 检查是否是车站内部弧（进站到出站）
+            is_station_arc = entry_flag_i == 0 and entry_flag_j == 1 and i == j and track_id is not None
             
-            # 记录终点时间位置
-            end_key = (i_pos, j_pos, s)
-            if end_key not in space_time_usage:
-                space_time_usage[end_key] = []
-            space_time_usage[end_key].append(train_idx)
+            # 计算弧上所有可能的空间位置点
+            space_positions = list(range(i_pos, j_pos + 1))
             
-            # 添加headway范围内的时间点 - 确保与构建不兼容弧集合时使用相同的headway值
-            for h in range(1, headway + 1):  # 使用传入的headway参数
-                # 起点时间前后的时间点
-                for time_offset in [-h, h]:
-                    t_offset = t + time_offset
-                    t_key = (i_pos, j_pos, t_offset)
-                    if t_key not in space_time_usage:
-                        space_time_usage[t_key] = []
-                    space_time_usage[t_key].append(train_idx)
-                
-                # 终点时间前后的时间点
-                for time_offset in [-h, h]:
-                    s_offset = s + time_offset
-                    s_key = (i_pos, j_pos, s_offset)
-                    if s_key not in space_time_usage:
-                        space_time_usage[s_key] = []
-                    space_time_usage[s_key].append(train_idx)
+            # 计算时间的线性插值
+            if i_pos != j_pos:  # 避免除以零
+                time_step = (s - t) / (j_pos - i_pos)
+                for pos in space_positions:
+                    # 计算当前位置对应的时间（线性插值）
+                    curr_time = int(t + (pos - i_pos) * time_step)
+                    
+                    # 记录当前空间-时间位置
+                    # 对于车站内部弧，添加股道信息
+                    if is_station_arc:
+                        curr_key = (pos, pos, curr_time, track_id)
+                    else:
+                        curr_key = (pos, pos, curr_time, None)
+                    
+                    if curr_key not in space_time_usage:
+                        space_time_usage[curr_key] = []
+                    space_time_usage[curr_key].append(train_idx)
+                    
+                    # 添加headway范围内的时间点
+                    for h in range(1, headway + 1):
+                        for time_offset in [-h, h]:
+                            offset_time = curr_time + time_offset
+                            if is_station_arc:
+                                offset_key = (pos, pos, offset_time, track_id)
+                            else:
+                                offset_key = (pos, pos, offset_time, None)
+                            
+                            if offset_key not in space_time_usage:
+                                space_time_usage[offset_key] = []
+                            space_time_usage[offset_key].append(train_idx)
+            else:
+                # 如果是同一空间位置（垂直弧）
+                # 记录起点和终点，以及它们之间的所有时间点
+                start_time, end_time = min(t, s), max(t, s)
+                for curr_time in range(start_time, end_time + 1):
+                    if is_station_arc:
+                        curr_key = (i_pos, j_pos, curr_time, track_id)
+                    else:
+                        curr_key = (i_pos, j_pos, curr_time, None)
+                    
+                    if curr_key not in space_time_usage:
+                        space_time_usage[curr_key] = []
+                    space_time_usage[curr_key].append(train_idx)
+                    
+                    # 添加headway范围内的时间点
+                    for h in range(1, headway + 1):
+                        for time_offset in [-h, h]:
+                            offset_time = curr_time + time_offset
+                            if is_station_arc:
+                                offset_key = (i_pos, j_pos, offset_time, track_id)
+                            else:
+                                offset_key = (i_pos, j_pos, offset_time, None)
+                            
+                            if offset_key not in space_time_usage:
+                                space_time_usage[offset_key] = []
+                            space_time_usage[offset_key].append(train_idx)
     
     # 检查冲突并更新乘子
     conflict_zones = []
     for space_time_key, trains in space_time_usage.items():
-        # 如果同一时空位置有多列车使用，则存在冲突
-        if len(set(trains)) > 1:
-            violation = len(set(trains)) - 1  # 冲突的列车数减1
-            total_violations += violation
-            
-            # 更新该时空位置的乘子
-            if space_time_key not in new_multipliers:
-                new_multipliers[space_time_key] = 0
-            new_multipliers[space_time_key] = max(0, new_multipliers[space_time_key] + step_size * violation)
-
+        # 解析空间-时间键
+        if len(space_time_key) == 4:
+            i, j, t, track_id = space_time_key
+        else:
             i, j, t = space_time_key
-            conflict_zones.append((i, t, len(set(trains))))
+            track_id = None
+        
+        # 判断是否是车站节点
+        is_station_node = track_id is not None
+        
+        # 如果同一时空位置有多列车使用，则存在冲突
+        # 对于不同股道的站内弧，不视为冲突
+        if len(set(trains)) > 1:
+            # 只计算非车站节点或者同股道车站节点的冲突
+            if not is_station_node or (is_station_node and track_id is not None):
+                violation = len(set(trains)) - 1  # 冲突的列车数减1
+                total_violations += violation
+                
+                # 更新该时空位置的乘子
+                if space_time_key not in new_multipliers:
+                    new_multipliers[space_time_key] = 0
+                new_multipliers[space_time_key] = max(0, new_multipliers[space_time_key] + step_size * violation)
+
+                conflict_zones.append((i, t, len(set(trains))))
     
-    # 打印调试信息，检查乘子是否有效影响路径
+    # 打印调试信息
     print(f"总违反约束数: {total_violations}")  
     print(f"更新的乘子数量: {len(new_multipliers)}") 
     
@@ -641,15 +1212,16 @@ def visualize_path_violations(best_paths, best_selected_arcs, headway, ax):
     ax.legend(loc='upper left')
 
 import os
-def solve_multi_train_with_lagrangian(train_schedules, station_names, delta_d=5, delta_t=5, 
-                                      speed_levels=5, time_diff_minutes=5*60, total_distance=50,
-                                      max_distance=30, select_near_plan=True, a_max=5,
-                                      train_max_speed=5, headway=2, max_iterations=50, debug_mode=False):
+def solve_multi_train_with_lagrangian(train_schedules, station_names, train_reschedules=None, delta_d=5, delta_t=5, 
+                                     speed_levels=5, time_diff_minutes=5*60, total_distance=50,
+                                     max_distance=30, select_near_plan=True, a_max=5,
+                                     train_max_speed=5, headway=5, max_iterations=50, debug_mode=False, draw_plan=True):
     """
     使用拉格朗日松弛法求解多列车时刻表问题
     
     参数:
-        train_schedules: 列车时刻表列表，每个元素是一个列车的时刻表
+        train_schedules: 列车计划时刻表列表，每个元素是一个列车的时刻表，用于路径规划和约束
+        train_reschedules: 列车重调度方案列表，用于节点筛选，默认为None(使用train_schedules)
         station_names: 车站名称字典，键为位置，值为站名
         delta_d: 空间单位长度，默认为5km
         delta_t: 时间单位长度，默认为5分钟
@@ -666,7 +1238,15 @@ def solve_multi_train_with_lagrangian(train_schedules, station_names, delta_d=5,
     返回:
         all_train_paths: 所有列车的最优路径
     """
+    
     start_time = time.time()
+
+    # 将headway从分钟转换为时间单位
+    headway = math.ceil(headway / delta_t)   
+    
+    # 如果未提供重调度方案，则使用计划时刻表
+    if train_reschedules is None:
+        train_reschedules = train_schedules
     
     # 初步计算
     time_nodes = math.ceil(time_diff_minutes / delta_t)
@@ -675,13 +1255,16 @@ def solve_multi_train_with_lagrangian(train_schedules, station_names, delta_d=5,
     time_nodes, space_segments, delta_t, delta_d = check_time_nodes_and_space_segments(
         time_nodes, space_segments, delta_t, delta_d, time_diff_minutes, total_distance)
     
-    # 转换站点时刻表为单位值
+    # 转换计划时刻表和重调度方案为单位值
     train_schedules, station_names = trans_df_grid(train_schedules, station_names, delta_t, delta_d)
+    train_reschedules, _ = trans_df_grid(train_reschedules, station_names, delta_t, delta_d)
     
-    # 确保train_schedules是列表的列表
+    # 确保train_schedules和train_reschedules是列表的列表
     if not isinstance(train_schedules[0], list):
         train_schedules = [train_schedules]
-    
+    if not isinstance(train_reschedules[0], list):
+        train_reschedules = [train_reschedules]
+        
     # 获取所有站点位置
     all_station_positions = []
     for train_schedule in train_schedules:
@@ -699,7 +1282,24 @@ def solve_multi_train_with_lagrangian(train_schedules, station_names, delta_d=5,
     for i in space_range:
         for t in time_range:
             for v in speed_range:
-                all_nodes.add((i, t, v))
+                # 检查该位置是否为车站
+                is_station = i in all_station_positions
+                
+                if is_station:
+                    # 对于车站节点，创建进站和出站两种节点
+                    # 进站节点: (位置, 时间, 速度, 0, None)，其中0表示进站
+                    all_nodes.add((i, t, v, 0, None))
+                    
+                    # 对于出站节点，为每个可能的股道创建节点
+                    # 根据车站规模设置股道数量，这里假设所有车站都有相同数量的股道
+                    num_tracks = 3  # 可以根据实际情况调整每个车站的股道数
+                    for track in range(num_tracks):
+                        # 出站节点: (位置, 时间, 速度, 1, 股道编号)，其中1表示出站
+                        all_nodes.add((i, t, v, 1, track))
+                else:
+                    # 对于非车站节点，保持原有结构，但增加标记和默认股道值
+                    # 非车站节点: (位置, 时间, 速度, None, None)
+                    all_nodes.add((i, t, v, None, None))
     print(f"初始网格节点总数: {len(all_nodes)}")
     
     # 获取所有列车的有效节点和图
@@ -711,27 +1311,23 @@ def solve_multi_train_with_lagrangian(train_schedules, station_names, delta_d=5,
     plt.rcParams['axes.unicode_minus'] = False    # 正常显示负号
     
     # 获取屏幕分辨率信息并据此设置图形大小
-    fig = plt.figure(figsize=(10, 8))  # 使用更适合标准屏幕的尺寸
-    
-    # 调整DPI以确保图形清晰且适合屏幕
-    fig.set_dpi(100)  # 设置适当的DPI值
+    fig = plt.figure(figsize=(10, 8))
+    fig.set_dpi(100)
     
     # 创建3D子图
     ax = fig.add_subplot(111, projection='3d')
+    ax.view_init(elev=30, azim=45)
     
-    # 调整视角使图形更容易查看
-    ax.view_init(elev=30, azim=45)  # 设置仰角和方位角
-    
-    # 使用线程池并行处理所有列车 根据系统CPU核心数自动调整线程数，但最大不超过8个线程
+    # 使用线程池并行处理所有列车
     num_workers = min(os.cpu_count(), 16) if os.cpu_count() else 4
     print(f"当前系统使用 {num_workers} 个线程进行并行计算")
     with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
-        # 提交所有任务到线程池
+        # 提交所有任务到线程池，使用重调度方案进行节点筛选
         future_to_train = {
             executor.submit(
                 process_single_train, 
                 train_idx, 
-                train_schedule, 
+                train_reschedule,  # 使用重调度方案进行节点筛选 
                 all_nodes, 
                 train_max_speed, 
                 select_near_plan, 
@@ -739,11 +1335,11 @@ def solve_multi_train_with_lagrangian(train_schedules, station_names, delta_d=5,
                 max_distance, 
                 a_max
             ): train_idx 
-            for train_idx, train_schedule in enumerate(train_schedules)
+            for train_idx, train_reschedule in enumerate(train_reschedules)
         }
         
         # 收集结果并保持原有顺序
-        results = [None] * len(train_schedules)
+        results = [None] * len(train_reschedules)
         for future in concurrent.futures.as_completed(future_to_train):
             train_idx, valid_nodes, graph, _ = future.result()
             train_valid_nodes.append(valid_nodes)
@@ -792,12 +1388,12 @@ def solve_multi_train_with_lagrangian(train_schedules, station_names, delta_d=5,
 
     # 拉格朗日乘子迭代求解
     multipliers = {}  # 初始化拉格朗日乘子为0
-    step_size = 100.  # 增大初始步长加快乘子增长
+    step_size = 10000.  # 增大初始步长加快乘子增长
     
     best_paths = None
     best_violations = float('inf')
     
-    # 创建每个列车的起点和终点
+    # 创建每个列车的起点和终点（使用计划时刻表）
     train_start_end_nodes = []
     for train_idx, train_schedule in enumerate(train_schedules):
         start_node = (train_schedule[0][0], train_schedule[0][2], 0)
@@ -861,9 +1457,10 @@ def solve_multi_train_with_lagrangian(train_schedules, station_names, delta_d=5,
             print(f"共绘制了 {penalty_arcs_count} 条带惩罚的弧")
         
         # 更新拉格朗日乘子
-        new_multipliers, violations, conflict_zones = update_multipliers(multipliers, all_selected_arcs, step_size, headway)
+        draw_debug_mode = iteration == max_iterations - 1 and debug_mode
+        new_multipliers, violations, conflict_zones = update_multipliers(multipliers, all_selected_arcs, step_size, headway, draw_debug_mode, ax)
         
-        if iteration == max_iterations - 1 and debug_mode:
+        if draw_debug_mode:
             # 在绘图时标记冲突区域
             if conflict_zones:
                 conflict_data = np.array(conflict_zones)
@@ -925,6 +1522,15 @@ def solve_multi_train_with_lagrangian(train_schedules, station_names, delta_d=5,
             # 绘制在空间-时间平面的投影
             ax.plot(path_space, path_time, np.zeros_like(path_speed), 
                     color=train_color, linewidth=2, linestyle='--', alpha=0.7)
+            # 绘制在空间-速度平面的投影
+            ax.plot(path_space, np.zeros_like(path_time), path_speed, 
+                    color=train_color, linewidth=2, linestyle='-.', alpha=0.7)
+            # 绘制在时间-速度平面的投影
+            ax.plot(np.zeros_like(path_space), path_time, path_speed, 
+                    color=train_color, linewidth=2, linestyle=':', alpha=0.7)
+        print("绘制出计划时刻表")
+        for each_schedule in train_schedules:
+            draw_plan_on_sts_grid(ax, each_schedule, space_segments, time_nodes, draw_plan=draw_plan)
     if debug_mode:
         # 绘制惩罚分布变化
         fig_penalty = plt.figure(figsize=(10, 6))
@@ -932,7 +1538,7 @@ def solve_multi_train_with_lagrangian(train_schedules, station_names, delta_d=5,
         plot_penalty_distribution(multipliers_history, ax_penalty)
         plt.savefig('penalty_distribution.png')
     
-    # 绘制最终结果后，可视化路径违反情况
+    # region 绘制最终结果后，可视化路径违反情况
     # if best_paths and best_violations > 0:
     #     print("可视化路径冲突...")
     #     # 获取最佳路径对应的弧
@@ -951,6 +1557,7 @@ def solve_multi_train_with_lagrangian(train_schedules, station_names, delta_d=5,
         
     #     # 可视化路径冲突
     #     visualize_path_violations(best_paths, best_selected_arcs, headway, ax)
+    # endregion
             # 完善图形显示
     finalize_plot(ax, space_segments, time_nodes, speed_levels, delta_d, delta_t)
     
@@ -958,158 +1565,21 @@ def solve_multi_train_with_lagrangian(train_schedules, station_names, delta_d=5,
 
 
 if __name__ == "__main__":
-    # 定义两个列车的时刻表
-    # 定义更复杂的列车时刻表，增加列车数量和站点数量
-    train_schedule1 = [
-        [0, 0, '8:00', '8:00', 4],      # 北京南站(始发站) 
-        [40, 1, '8:12', '8:12', 4],     # 固安站(通过站)
-        [70, 2, '8:20', '8:25', 4],     # 廊坊站(停靠站) 
-        [100, 1, '8:35', '8:35', 4],    # 胜芳站(通过站)
-        [140, 2, '8:50', '8:55', 4],    # 天津站(停靠站)
-        [170, 1, '9:10', '9:10', 4],    # 塘沽站(通过站)
-        [200, 0, '9:30', '9:30', 4],    # 滨海站(终点站)
-    ]
-    
-    train_schedule2 = [
-        [0, 0, '8:10', '8:10', 4],      # 北京南站(始发站) 
-        [40, 1, '8:20', '8:20', 4],     # 固安站(通过站)
-        [70, 2, '8:28', '8:33', 4],     # 廊坊站(停靠站) 
-        [100, 1, '8:45', '8:45', 4],    # 胜芳站(通过站)
-        [140, 2, '9:00', '9:05', 4],    # 天津站(停靠站)
-        [170, 1, '9:18', '9:18', 4],    # 塘沽站(通过站)
-        [200, 0, '9:40', '9:40', 4],    # 滨海站(终点站)
-    ]
-    
-    train_schedule3 = [
-        [0, 0, '8:20', '8:20', 4],      # 北京南站(始发站) 
-        [40, 1, '8:35', '8:35', 4],     # 固安站(通过站)
-        [70, 2, '8:43', '8:48', 4],     # 廊坊站(停靠站) 
-        [100, 1, '8:55', '8:55', 4],    # 胜芳站(通过站)
-        [140, 2, '9:10', '9:15', 4],    # 天津站(停靠站)
-        [170, 1, '9:32', '9:32', 4],    # 塘沽站(通过站)
-        [200, 0, '9:50', '9:50', 4],    # 滨海站(终点站)
-    ]
-    
-    train_schedule4 = [
-        [0, 0, '8:30', '8:30', 4],      # 北京南站(始发站) 
-        [40, 1, '8:40', '8:40', 4],     # 固安站(通过站)
-        [70, 2, '8:48', '8:53', 4],     # 廊坊站(停靠站) 
-        [100, 1, '9:05', '9:05', 4],    # 胜芳站(通过站)
-        [140, 2, '9:20', '9:25', 4],    # 天津站(停靠站)
-        [170, 1, '9:38', '9:38', 4],    # 塘沽站(通过站)
-        [200, 0, '10:00', '10:00', 4],  # 滨海站(终点站)
-    ]
-    
-    train_schedule5 = [
-        [0, 0, '8:40', '8:40', 4],      # 北京南站(始发站) 
-        [40, 1, '8:55', '8:55', 4],     # 固安站(通过站)
-        [70, 2, '9:03', '9:08', 4],     # 廊坊站(停靠站) 
-        [100, 1, '9:15', '9:15', 4],    # 胜芳站(通过站)
-        [140, 2, '9:30', '9:35', 4],    # 天津站(停靠站)
-        [170, 1, '9:52', '9:52', 4],    # 塘沽站(通过站)
-        [200, 0, '10:10', '10:10', 4],  # 滨海站(终点站)
-    ]
-    
-    train_schedule6 = [
-        [0, 0, '8:50', '8:50', 4],      # 北京南站(始发站) 
-        [40, 1, '9:00', '9:00', 4],     # 固安站(通过站)
-        [70, 2, '9:08', '9:13', 4],     # 廊坊站(停靠站) 
-        [100, 1, '9:25', '9:25', 4],    # 胜芳站(通过站)
-        [140, 2, '9:40', '9:45', 4],    # 天津站(停靠站)
-        [170, 1, '9:58', '9:58', 4],    # 塘沽站(通过站)
-        [200, 0, '10:20', '10:20', 4],  # 滨海站(终点站)
-    ]
-    
-    train_schedule7 = [
-        [0, 0, '9:00', '9:00', 4],      # 北京南站(始发站) 
-        [40, 1, '9:15', '9:15', 4],     # 固安站(通过站)
-        [70, 2, '9:23', '9:28', 4],     # 廊坊站(停靠站) 
-        [100, 1, '9:35', '9:35', 4],    # 胜芳站(通过站)
-        [140, 2, '9:50', '9:55', 4],    # 天津站(停靠站)
-        [170, 1, '10:12', '10:12', 4],  # 塘沽站(通过站)
-        [200, 0, '10:30', '10:30', 4],  # 滨海站(终点站)
-    ]
-    
-    train_schedule8 = [
-        [0, 0, '9:10', '9:10', 4],      # 北京南站(始发站) 
-        [40, 1, '9:20', '9:20', 4],     # 固安站(通过站)
-        [70, 2, '9:28', '9:33', 4],     # 廊坊站(停靠站) 
-        [100, 1, '9:45', '9:45', 4],    # 胜芳站(通过站)
-        [140, 2, '10:00', '10:05', 4],  # 天津站(停靠站)
-        [170, 1, '10:18', '10:18', 4],  # 塘沽站(通过站)
-        [200, 0, '10:40', '10:40', 4],  # 滨海站(终点站)
-    ]
-    
-    train_schedule9 = [
-        [0, 0, '9:20', '9:20', 4],      # 北京南站(始发站) 
-        [40, 1, '9:35', '9:35', 4],     # 固安站(通过站)
-        [70, 2, '9:43', '9:48', 4],     # 廊坊站(停靠站) 
-        [100, 1, '9:55', '9:55', 4],    # 胜芳站(通过站)
-        [140, 2, '10:10', '10:15', 4],  # 天津站(停靠站)
-        [170, 1, '10:32', '10:32', 4],  # 塘沽站(通过站)
-        [200, 0, '10:50', '10:50', 4],  # 滨海站(终点站)
-    ]
-    
-    train_schedule10 = [
-        [0, 0, '9:30', '9:30', 4],      # 北京南站(始发站) 
-        [40, 1, '9:40', '9:40', 4],     # 固安站(通过站)
-        [70, 2, '9:48', '9:53', 4],     # 廊坊站(停靠站) 
-        [100, 1, '10:05', '10:05', 4],  # 胜芳站(通过站)
-        [140, 2, '10:20', '10:25', 4],  # 天津站(停靠站)
-        [170, 1, '10:38', '10:38', 4],  # 塘沽站(通过站)
-        [200, 0, '11:00', '11:00', 4],  # 滨海站(终点站)
-    ]
-    
-    # 增加更多列车以测试算法性能
-    train_schedule11 = [
-        [0, 0, '9:40', '9:40', 4],      # 北京南站(始发站) 
-        [40, 1, '9:55', '9:55', 4],     # 固安站(通过站)
-        [70, 2, '10:03', '10:08', 4],   # 廊坊站(停靠站) 
-        [100, 1, '10:15', '10:15', 4],  # 胜芳站(通过站)
-        [140, 2, '10:30', '10:35', 4],  # 天津站(停靠站)
-        [170, 1, '10:52', '10:52', 4],  # 塘沽站(通过站)
-        [200, 0, '11:10', '11:10', 4],  # 滨海站(终点站)
-    ]
-    
-    train_schedule12 = [
-        [0, 0, '9:50', '9:50', 4],      # 北京南站(始发站) 
-        [40, 1, '10:00', '10:00', 4],   # 固安站(通过站)
-        [70, 2, '10:08', '10:13', 4],   # 廊坊站(停靠站) 
-        [100, 1, '10:25', '10:25', 4],  # 胜芳站(通过站)
-        [140, 2, '10:40', '10:45', 4],  # 天津站(停靠站)
-        [170, 1, '10:58', '10:58', 4],  # 塘沽站(通过站)
-        [200, 0, '11:20', '11:20', 4],  # 滨海站(终点站)
-    ]
-    
-    train_schedule13 = [
-        [0, 0, '10:00', '10:00', 4],    # 北京南站(始发站) 
-        [40, 1, '10:15', '10:15', 4],   # 固安站(通过站)
-        [70, 2, '10:23', '10:28', 4],   # 廊坊站(停靠站) 
-        [100, 1, '10:35', '10:35', 4],  # 胜芳站(通过站)
-        [140, 2, '10:50', '10:55', 4],  # 天津站(停靠站)
-        [170, 1, '11:12', '11:12', 4],  # 塘沽站(通过站)
-        [200, 0, '11:30', '11:30', 4],  # 滨海站(终点站)
-    ]
-    
-    train_schedule14 = [
-        [0, 0, '10:10', '10:10', 4],    # 北京南站(始发站) 
-        [40, 1, '10:20', '10:20', 4],   # 固安站(通过站)
-        [70, 2, '10:28', '10:33', 4],   # 廊坊站(停靠站) 
-        [100, 1, '10:45', '10:45', 4],  # 胜芳站(通过站)
-        [140, 2, '11:00', '11:05', 4],  # 天津站(停靠站)
-        [170, 1, '11:18', '11:18', 4],  # 塘沽站(通过站)
-        [200, 0, '11:40', '11:40', 4],  # 滨海站(终点站)
-    ]
-    
-    train_schedule15 = [
-        [0, 0, '10:20', '10:20', 4],    # 北京南站(始发站) 
-        [40, 1, '10:35', '10:35', 4],   # 固安站(通过站)
-        [70, 2, '10:43', '10:48', 4],   # 廊坊站(停靠站) 
-        [100, 1, '10:55', '10:55', 4],  # 胜芳站(通过站)
-        [140, 2, '11:10', '11:15', 4],  # 天津站(停靠站)
-        [170, 1, '11:32', '11:32', 4],  # 塘沽站(通过站)
-        [200, 0, '11:50', '11:50', 4],  # 滨海站(终点站)
-    ]
+    # 从文件导入重调度的列车时刻表
+    from train_schedules import (
+        train_schedule1, train_schedule2, train_schedule3, train_schedule4,
+        train_schedule5, train_schedule6, train_schedule7, train_schedule8,
+        train_schedule9, train_schedule10, train_schedule11, train_schedule12,
+        train_schedule13, train_schedule14, train_schedule15
+    )
+
+    # 从文件导入计划列车时刻表
+    from train_schedules import (
+        train_timetable1, train_timetable2, train_timetable3, train_timetable4,
+        train_timetable5, train_timetable6, train_timetable7, train_timetable8,
+        train_timetable9, train_timetable10, train_timetable11, train_timetable12,
+        train_timetable13, train_timetable14, train_timetable15
+    )
     
     # 更新站点名称字典，增加新增站点
     station_names = {
@@ -1128,19 +1598,20 @@ if __name__ == "__main__":
     
     # 执行算法
     best_paths = solve_multi_train_with_lagrangian(
-        [train_schedule1, train_schedule2, train_schedule3, train_schedule4, train_schedule5, train_schedule6, train_schedule7, train_schedule8, train_schedule9, train_schedule10], 
-        # [train_schedule2, train_schedule3], 
+        [train_timetable1, train_timetable2],  # 计划时刻表  
         station_names,
-        delta_d=0.5,      # 500米
-        delta_t=0.5,      # 0.5分钟 30秒
+        train_reschedules=[train_schedule1, train_schedule2],  # 重调度方案
+        delta_d=1,
+        delta_t=1,
         speed_levels=5, 
         time_diff_minutes=4*60,   # 调度范围是2个小时
         total_distance=300,    # 300km的线路
-        max_distance=10,       # 25个格子
-        headway=2,             # 2个时间单位的最小间隔
-        max_iterations=10,      # 最多迭代50次
+        max_distance=15,       # 25个格子
+        headway=3,             # 3个时间单位的最小间隔
+        max_iterations=100,      # 最多迭代50次
         select_near_plan=True,  # 是否使用计划表完成有效点的筛选
         debug_mode=False,        # 是否开启调试模式
+        draw_plan=True,         # 是否绘制计划时刻表
     )
     
     # 计算并输出算法运行时间
